@@ -1,0 +1,11 @@
+.venv/
+.venv312/
+.tools/
+.repo_publish/
+.matplotlib/
+.smoke_*/
+source_results_*/
+source_baseline_runs/
+ocatari_transfer_results_*/
+__pycache__/
+*.pyc
