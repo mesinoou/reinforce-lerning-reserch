@@ -6,3 +6,4 @@ ale-py>=0.10,<0.13
 torch>=2.2
 numpy==1.26.4
 matplotlib>=3.8
+Pillow>=9

@@ -8,6 +8,7 @@ source_results_*/
 source_baseline_runs/
 benchmark_source_*.json
 benchmark_results/
+playback_*/
 ocatari_transfer_results_*/
 __pycache__/
 *.pyc

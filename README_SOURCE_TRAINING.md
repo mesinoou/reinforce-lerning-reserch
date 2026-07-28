@@ -192,6 +192,67 @@ python ocatari_source_ppo.py \
 ログ、Python/NumPy/PyTorch/CUDAの乱数状態を復元する。ALE内部状態は
 移植性のため保存せず、新しいエピソードから再開する。
 
+## 学習済みモデルのプレイ画像
+
+`render_trained_agent.py`は最終モデル、最良モデル、最新checkpointのいずれも
+読み込める。
+
+```text
+model.pt
+checkpoint_best.pt
+checkpoint_latest.pt
+```
+
+最終モデルをdeterministic方策で再生する例:
+
+```bash
+python render_trained_agent.py \
+  --model source_baseline_runs/seed_0/model.pt \
+  --episodes 1 \
+  --seed 100000 \
+  --policy deterministic \
+  --device cpu \
+  --capture-every 4 \
+  --max-representative-frames 20 \
+  --columns 4 \
+  --scale 2 \
+  --output-dir source_baseline_runs/seed_0/playback_final
+```
+
+定期評価で最良だったモデル:
+
+```bash
+python render_trained_agent.py \
+  --model source_baseline_runs/seed_0/checkpoint_best.pt \
+  --episodes 3 \
+  --policy deterministic \
+  --output-dir source_baseline_runs/seed_0/playback_best
+```
+
+出力:
+
+- `episode_001_contact_sheet.png`: episode全体の時系列コンタクトシート
+- `episode_001_final.png`: episode終了時の画面
+- `episode_001_frames/*.png`: episode全体から抽出した代表フレーム
+- `episode_001_trajectory.csv`: action、raw reward、Value、方策確率、life
+- `playback_summary.json`: モデルSHA-256、seed、方策、return、再生条件
+
+既定ではREM物体の枠とカテゴリ名を重ねる。ゲーム画面だけを保存する場合:
+
+```bash
+python render_trained_agent.py \
+  --model source_baseline_runs/seed_0/model.pt \
+  --no-overlay-objects
+```
+
+`deterministic`は各状態で最大確率の行動を選ぶため、固定seedで比較画像を
+作る用途に適している。学習時のように方策分布からサンプルする場合は
+`--policy stochastic`を使用する。
+
+最終`model.pt`にはモデル重みとencoder設定が含まれ、同じディレクトリの
+`config.json`からREM、frameskip、最大episode長などを復元する。
+`checkpoint_best/latest.pt`は必要な実行設定もcheckpoint内に保持している。
+
 ## 報酬モード
 
 - `raw`: ゲーム本来の報酬
