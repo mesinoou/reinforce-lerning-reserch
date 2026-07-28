@@ -35,3 +35,14 @@
 - episodeごとにscore、生存、life lossの報酬成分を分離して記録。
 - PPO更新ごとにraw rewardとtraining rewardの平均・標準偏差を記録し、
   スケーリング効果と生存報酬の支配を診断可能にした。
+
+### Progress and throughput benchmark
+
+- 学習中に進捗率、現在・残りsteps、平均速度、経過時間、ETA、推定終了日時を
+  定期表示する機能を追加。
+- 実行中に安全に読み取れる`progress.json`と履歴用`progress.csv`を追加。
+- resume後は残りstepsと再開processの実測速度からETAを再計算。
+- REM抽出、物体変換、方策推論、GAE、PPO更新、診断処理を含めて実測する
+  `benchmark_source_training.py`を追加。
+- 指定時間から予測stepsを、目標stepsから予測所要時間を計算。
+- 評価・checkpoint等の除外時間を考慮するconservative予測を追加。

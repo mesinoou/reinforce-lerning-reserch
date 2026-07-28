@@ -1,4 +1,5 @@
 import unittest
+import time
 
 import numpy as np
 import torch
@@ -10,10 +11,13 @@ from ocatari_source_ppo import (
     RewardConfig,
     RolloutBuffer,
     count_ale_frames_advanced,
+    format_duration,
+    make_progress_row,
     ppo_update,
     reward_components,
     transform_reward,
 )
+from benchmark_source_training import projection_rows
 from ocatari_transfer_full_experiment import (
     ActorCriticMLP,
     CommonObjectEncoder,
@@ -159,6 +163,47 @@ class RewardAndBufferTests(unittest.TestCase):
         self.assertEqual(
             count_ale_frames_advanced({}, {}, fallback_frameskip=4),
             4,
+        )
+
+    def test_progress_row_contains_eta_and_remaining_steps(self):
+        now = time.time()
+        row = make_progress_row(
+            status="running",
+            env_steps=500,
+            total_env_steps=1_000,
+            update_index=5,
+            episode_index=2,
+            starting_env_steps=0,
+            start_time=now - 10.0,
+            previous_progress_step=400,
+            previous_progress_time=now - 2.0,
+            episode_rows=[{"raw_return": 100.0}, {"raw_return": 200.0}],
+        )
+        self.assertAlmostEqual(row["progress_percent"], 50.0)
+        self.assertEqual(row["remaining_env_steps"], 500)
+        self.assertGreater(row["average_steps_per_second"], 0.0)
+        self.assertIsNotNone(row["eta_seconds"])
+        self.assertEqual(row["recent_raw_return_mean"], 150.0)
+
+    def test_duration_format_and_benchmark_projection(self):
+        self.assertEqual(format_duration(3_661), "01:01:01")
+        by_time, by_steps = projection_rows(
+            steps_per_second=100.0,
+            reserve_fraction=0.10,
+            project_hours=[1.0],
+            target_steps=[360_000],
+        )
+        self.assertEqual(
+            by_time[0]["measured_projection_env_steps"],
+            360_000,
+        )
+        self.assertEqual(
+            by_time[0]["conservative_projection_env_steps"],
+            324_000,
+        )
+        self.assertEqual(
+            by_steps[0]["measured_estimated_time"],
+            "01:00:00",
         )
 
     def test_terminal_breaks_gae(self):
