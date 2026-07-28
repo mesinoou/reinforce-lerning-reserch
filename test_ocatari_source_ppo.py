@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 import torch.optim as optim
+from PIL import Image
 
 from ocatari_source_ppo import (
     ObservationStatistics,
@@ -18,6 +19,11 @@ from ocatari_source_ppo import (
     transform_reward,
 )
 from benchmark_source_training import projection_rows
+from render_trained_agent import (
+    CapturedFrame,
+    RepresentativeFrameReservoir,
+    make_contact_sheet,
+)
 from ocatari_transfer_full_experiment import (
     ActorCriticMLP,
     CommonObjectEncoder,
@@ -261,6 +267,39 @@ class PPOTests(unittest.TestCase):
                 for old, new in zip(before, model.parameters())
             )
         )
+
+
+class PlaybackImageTests(unittest.TestCase):
+    def test_representative_frames_keep_start_and_end(self):
+        reservoir = RepresentativeFrameReservoir(capacity=5, seed=0)
+        for step in range(10):
+            reservoir.add(
+                CapturedFrame(
+                    step=step,
+                    cumulative_raw_return=float(step),
+                    action_meaning="TEST",
+                    image=Image.new("RGB", (16, 16), color=(step, 0, 0)),
+                )
+            )
+        selected = reservoir.selected()
+        selected_steps = [capture.step for capture in selected]
+        self.assertEqual(selected_steps[0], 0)
+        self.assertEqual(selected_steps[-1], 9)
+        self.assertLessEqual(len(selected), 5)
+        self.assertEqual(selected_steps, sorted(selected_steps))
+
+    def test_contact_sheet_has_expected_grid_size(self):
+        captures = [
+            CapturedFrame(
+                step=step,
+                cumulative_raw_return=0.0,
+                action_meaning="NOOP",
+                image=Image.new("RGB", (20, 30)),
+            )
+            for step in range(5)
+        ]
+        sheet = make_contact_sheet(captures, columns=2, title="test")
+        self.assertEqual(sheet.size, (40, 56 + 3 * (30 + 28)))
 
 
 if __name__ == "__main__":

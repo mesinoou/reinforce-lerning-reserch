@@ -46,3 +46,13 @@
   `benchmark_source_training.py`を追加。
 - 指定時間から予測stepsを、目標stepsから予測所要時間を計算。
 - 評価・checkpoint等の除外時間を考慮するconservative予測を追加。
+
+### Trained-agent play images
+
+- `model.pt`、`checkpoint_best.pt`、`checkpoint_latest.pt`を読み込める
+  `render_trained_agent.py`を追加。
+- 保存済みencoder、PPO、REM、frameskip設定から学習時のモデル入力を再構築。
+- episode全体から代表フレームをメモリ上限付きで抽出。
+- 物体枠付き代表PNG、最終フレーム、時系列コンタクトシートを保存。
+- action、raw reward、Value、方策確率、entropy、lifeをtrajectory CSVへ保存。
+- モデルSHA-256、seed、方策、再生条件、出力パスをsummaryへ保存。
