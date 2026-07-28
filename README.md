@@ -21,6 +21,10 @@ Space InvadersのPPO学習を成立させ、その後GalaxianへのAdvantage転�
 
 - `ocatari_source_ppo.py`: 転移前のソースタスク単独学習
 - `run_source_seeds.sh`: Linux上での複数seed実行
+- `benchmark_source_training.py`: 学習時間とstepsの実測・換算
 - `aggregate_source_runs.py`: seed間集計
 - `test_ocatari_source_ppo.py`: 単体テスト
 - `ocatari_transfer_full_experiment.py`: 既存の一括転移実験
+
+学習中は各runの`progress.json`から進捗率、処理速度、残りsteps、ETA、
+推定終了時刻を確認できます。

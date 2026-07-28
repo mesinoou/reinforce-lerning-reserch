@@ -19,7 +19,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -100,6 +100,24 @@ EVALUATION_FIELDS = [
     "raw_return_max",
     "episode_length_mean",
 ]
+PROGRESS_FIELDS = [
+    "timestamp",
+    "status",
+    "env_steps",
+    "total_env_steps",
+    "remaining_env_steps",
+    "progress_percent",
+    "updates",
+    "episodes",
+    "elapsed_seconds_this_process",
+    "elapsed_human",
+    "average_steps_per_second",
+    "recent_steps_per_second",
+    "eta_seconds",
+    "eta_human",
+    "estimated_finish_time",
+    "recent_raw_return_mean",
+]
 
 
 @dataclass
@@ -141,6 +159,90 @@ class RewardComponents:
     @property
     def total(self) -> float:
         return self.score + self.survival + self.life_loss
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "unknown"
+    total_seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(total_seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds_value = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds_value:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds_value:02d}"
+
+
+def save_json_atomic(path: Path, value: Any) -> None:
+    ensure_dir(path.parent)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        json.dump(value, file, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, path)
+
+
+def make_progress_row(
+    *,
+    status: str,
+    env_steps: int,
+    total_env_steps: int,
+    update_index: int,
+    episode_index: int,
+    starting_env_steps: int,
+    start_time: float,
+    previous_progress_step: int,
+    previous_progress_time: float,
+    episode_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    now = time.time()
+    elapsed = max(0.0, now - start_time)
+    processed = max(0, env_steps - starting_env_steps)
+    average_sps = processed / elapsed if elapsed > 0.0 else 0.0
+    recent_elapsed = max(0.0, now - previous_progress_time)
+    recent_steps = max(0, env_steps - previous_progress_step)
+    recent_sps = (
+        recent_steps / recent_elapsed if recent_elapsed > 0.0 else 0.0
+    )
+    remaining = max(0, total_env_steps - env_steps)
+    eta_sps = average_sps if average_sps > 0.0 else recent_sps
+    eta_seconds: Optional[float] = (
+        remaining / eta_sps if eta_sps > 0.0 else None
+    )
+    estimated_finish = (
+        (datetime.now().astimezone() + timedelta(seconds=eta_seconds)).isoformat(
+            timespec="seconds"
+        )
+        if eta_seconds is not None
+        else None
+    )
+    recent_episode_rows = episode_rows[-100:]
+    recent_raw_return_mean = (
+        float(
+            np.mean([row["raw_return"] for row in recent_episode_rows])
+        )
+        if recent_episode_rows
+        else None
+    )
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": status,
+        "env_steps": env_steps,
+        "total_env_steps": total_env_steps,
+        "remaining_env_steps": remaining,
+        "progress_percent": (
+            100.0 * env_steps / max(1, total_env_steps)
+        ),
+        "updates": update_index,
+        "episodes": episode_index,
+        "elapsed_seconds_this_process": elapsed,
+        "elapsed_human": format_duration(elapsed),
+        "average_steps_per_second": average_sps,
+        "recent_steps_per_second": recent_sps,
+        "eta_seconds": eta_seconds,
+        "eta_human": format_duration(eta_seconds),
+        "estimated_finish_time": estimated_finish,
+        "recent_raw_return_mean": recent_raw_return_mean,
+    }
 
 
 class RolloutBuffer:
@@ -829,6 +931,7 @@ def save_checkpoint(
     update_rows: List[Dict[str, Any]],
     evaluation_rows: List[Dict[str, Any]],
     action_rows: List[Dict[str, Any]],
+    progress_rows: List[Dict[str, Any]],
     observation_statistics: ObservationStatistics,
     object_diagnostics: ObjectDiagnostics,
     best_evaluation_return: float,
@@ -864,6 +967,7 @@ def save_checkpoint(
             "update_logs": update_rows,
             "evaluation_logs": evaluation_rows,
             "action_logs": action_rows,
+            "progress_logs": progress_rows,
             "observation_statistics": observation_statistics.state_dict(),
             "object_diagnostics": object_diagnostics.state_dict(),
         },
@@ -877,6 +981,7 @@ def save_progress_files(
     update_rows: List[Dict[str, Any]],
     evaluation_rows: List[Dict[str, Any]],
     action_rows: List[Dict[str, Any]],
+    progress_rows: List[Dict[str, Any]],
     observation_statistics: ObservationStatistics,
     object_diagnostics: ObjectDiagnostics,
     encoder_config: EncoderConfig,
@@ -894,6 +999,11 @@ def save_progress_files(
             sorted(key for key in action_rows[0] if key not in action_fields)
         )
     save_csv(output_dir / "action_distribution.csv", action_rows, action_fields)
+    save_csv(
+        output_dir / "progress.csv",
+        progress_rows,
+        PROGRESS_FIELDS,
+    )
     save_csv(
         output_dir / "object_categories.csv",
         object_diagnostics.category_rows(),
@@ -1225,6 +1335,8 @@ def train(args: argparse.Namespace) -> Path:
             "object_sample_frames",
             "moving_average_window",
             "log_interval_episodes",
+            "progress_interval_updates",
+            "progress_interval_seconds",
         }
         for key, value in stored_arguments.items():
             if key not in runtime_override_keys and hasattr(args, key):
@@ -1308,6 +1420,7 @@ def train(args: argparse.Namespace) -> Path:
     update_rows: List[Dict[str, Any]] = []
     evaluation_rows: List[Dict[str, Any]] = []
     action_rows: List[Dict[str, Any]] = []
+    progress_rows: List[Dict[str, Any]] = []
     object_samples: List[Dict[str, Any]] = []
     global_steps = 0
     update_index = 0
@@ -1339,6 +1452,7 @@ def train(args: argparse.Namespace) -> Path:
         update_rows = list(checkpoint.get("update_logs", []))
         evaluation_rows = list(checkpoint.get("evaluation_logs", []))
         action_rows = list(checkpoint.get("action_logs", []))
+        progress_rows = list(checkpoint.get("progress_logs", []))
         if "observation_statistics" in checkpoint:
             observation_statistics.load_state_dict(
                 checkpoint["observation_statistics"]
@@ -1443,6 +1557,47 @@ def train(args: argparse.Namespace) -> Path:
         )
 
     start_time = time.time()
+    last_progress_time = start_time
+    last_progress_step = global_steps
+
+    def record_training_progress(status: str) -> None:
+        nonlocal last_progress_time, last_progress_step
+        row = make_progress_row(
+            status=status,
+            env_steps=global_steps,
+            total_env_steps=args.total_steps,
+            update_index=update_index,
+            episode_index=episode_index,
+            starting_env_steps=starting_env_steps,
+            start_time=start_time,
+            previous_progress_step=last_progress_step,
+            previous_progress_time=last_progress_time,
+            episode_rows=episode_rows,
+        )
+        progress_rows.append(row)
+        save_json_atomic(output_dir / "progress.json", row)
+        save_csv(
+            output_dir / "progress.csv",
+            progress_rows,
+            PROGRESS_FIELDS,
+        )
+        finish_text = row["estimated_finish_time"] or "unknown"
+        print(
+            f"[progress] {row['progress_percent']:6.2f}% "
+            f"steps={row['env_steps']:,}/{row['total_env_steps']:,} "
+            f"remaining={row['remaining_env_steps']:,} "
+            f"updates={row['updates']:,} episodes={row['episodes']:,} "
+            f"speed={row['average_steps_per_second']:.1f} steps/s "
+            f"elapsed={row['elapsed_human']} eta={row['eta_human']} "
+            f"finish={finish_text}"
+        )
+        last_progress_time = time.time()
+        last_progress_step = global_steps
+
+    record_training_progress(
+        "completed" if global_steps >= args.total_steps else "starting"
+    )
+
     episode_raw_return = 0.0
     episode_training_return = 0.0
     episode_score_component_return = 0.0
@@ -1756,6 +1911,26 @@ def train(args: argparse.Namespace) -> Path:
                 )
             action_rows.append(action_row)
 
+            progress_due_to_updates = bool(
+                args.progress_interval_updates > 0
+                and update_index % args.progress_interval_updates == 0
+            )
+            progress_due_to_time = bool(
+                args.progress_interval_seconds > 0.0
+                and time.time() - last_progress_time
+                >= args.progress_interval_seconds
+            )
+            if (
+                progress_due_to_updates
+                or progress_due_to_time
+                or global_steps >= args.total_steps
+            ):
+                record_training_progress(
+                    "completed"
+                    if global_steps >= args.total_steps
+                    else "running"
+                )
+
             if global_steps >= next_eval_step:
                 new_evaluations = append_evaluation_rows(
                     evaluation_rows,
@@ -1788,6 +1963,7 @@ def train(args: argparse.Namespace) -> Path:
                         update_rows=update_rows,
                         evaluation_rows=evaluation_rows,
                         action_rows=action_rows,
+                        progress_rows=progress_rows,
                         observation_statistics=observation_statistics,
                         object_diagnostics=object_diagnostics,
                         best_evaluation_return=best_evaluation_return,
@@ -1807,6 +1983,7 @@ def train(args: argparse.Namespace) -> Path:
                     update_rows,
                     evaluation_rows,
                     action_rows,
+                    progress_rows,
                     observation_statistics,
                     object_diagnostics,
                     encoder_config,
@@ -1826,6 +2003,7 @@ def train(args: argparse.Namespace) -> Path:
                     update_rows=update_rows,
                     evaluation_rows=evaluation_rows,
                     action_rows=action_rows,
+                    progress_rows=progress_rows,
                     observation_statistics=observation_statistics,
                     object_diagnostics=object_diagnostics,
                     best_evaluation_return=best_evaluation_return,
@@ -1834,6 +2012,13 @@ def train(args: argparse.Namespace) -> Path:
                 )
                 while next_checkpoint_step <= global_steps:
                     next_checkpoint_step += args.checkpoint_interval
+
+        if (
+            not progress_rows
+            or progress_rows[-1]["env_steps"] != global_steps
+            or progress_rows[-1]["status"] != "completed"
+        ):
+            record_training_progress("completed")
 
         append_evaluation_rows(
             evaluation_rows,
@@ -1851,6 +2036,7 @@ def train(args: argparse.Namespace) -> Path:
             update_rows,
             evaluation_rows,
             action_rows,
+            progress_rows,
             observation_statistics,
             object_diagnostics,
             encoder_config,
@@ -1886,6 +2072,7 @@ def train(args: argparse.Namespace) -> Path:
             update_rows=update_rows,
             evaluation_rows=evaluation_rows,
             action_rows=action_rows,
+            progress_rows=progress_rows,
             observation_statistics=observation_statistics,
             object_diagnostics=object_diagnostics,
             best_evaluation_return=best_evaluation_return,
@@ -2078,6 +2265,18 @@ def parse_args() -> argparse.Namespace:
         type=positive_int,
         default=10,
     )
+    parser.add_argument(
+        "--progress-interval-updates",
+        type=nonnegative_int,
+        default=10,
+        help="Write progress and print ETA every N PPO updates; 0 disables.",
+    )
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=60.0,
+        help="Also report after this many seconds; 0 disables.",
+    )
     args = parser.parse_args()
 
     if not 0.0 <= args.repeat_action_probability <= 1.0:
@@ -2092,6 +2291,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--life-loss-penalty must be non-positive")
     if args.target_kl < 0.0:
         parser.error("--target-kl must be non-negative")
+    if args.progress_interval_seconds < 0.0:
+        parser.error("--progress-interval-seconds must be non-negative")
     if args.object_mode != "ram":
         print(
             "Warning: this stage is defined for OCAtari REM; "
@@ -2118,6 +2319,11 @@ def parse_args() -> argparse.Namespace:
         args.eval_episodes = min(args.eval_episodes, 2)
         args.random_eval_episodes = min(args.random_eval_episodes, 2)
         args.max_episode_steps = min(args.max_episode_steps, 5_000)
+        args.progress_interval_updates = 1
+        args.progress_interval_seconds = min(
+            args.progress_interval_seconds,
+            10.0,
+        )
     if args.resume and not args.output_dir:
         args.output_dir = str(Path(args.resume).resolve().parent)
     return args

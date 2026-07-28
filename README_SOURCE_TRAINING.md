@@ -72,6 +72,90 @@ python ocatari_source_ppo.py \
   --output-dir source_baseline_runs/seed_0
 ```
 
+## 学習進捗と残り時間
+
+学習中は既定で10 PPO updatesごと、または前回表示から60秒経過時に、
+次の情報を標準出力へ表示する。
+
+```text
+[progress] 42.60% steps=426,000/1,000,000 remaining=574,000
+updates=420 episodes=812 speed=153.2 steps/s
+elapsed=00:46:21 eta=01:02:27 finish=2026-07-28T23:14:00+09:00
+```
+
+表示間隔は変更できる。
+
+```bash
+python ocatari_source_ppo.py \
+  --progress-interval-updates 5 \
+  --progress-interval-seconds 30 \
+  ...
+```
+
+各出力ディレクトリの`progress.json`は実行中も更新される。別terminalから
+次のように確認できる。
+
+```bash
+watch -n 5 cat source_baseline_runs/seed_0/progress.json
+```
+
+`progress.csv`には履歴を保存する。主な項目:
+
+- 現在steps／総steps／残りsteps
+- 進捗率
+- PPO update数、完了episode数
+- 今回のprocessの経過時間
+- 平均・直近steps/秒
+- ETAと推定終了日時
+- 直近100 episodesの平均raw return
+
+resume時はcheckpointまでのstepsを引き継ぎ、ETAは再開processで実測した
+速度から再計算する。
+
+## 学習時間ベンチマーク
+
+`benchmark_source_training.py`は実際のREM抽出、物体中心入力変換、方策推論、
+GAE、PPO更新、メモリ上の診断処理を一定時間実行する。その実測速度から、
+指定時間で学習可能なenvironment stepsと、目標stepsの所要時間を計算する。
+
+Linux研究用PCでは本学習と同じCUDA・PPO条件で実行する。
+
+```bash
+python benchmark_source_training.py \
+  --device cuda \
+  --benchmark-seconds 120 \
+  --warmup-updates 2 \
+  --rollout-steps 1024 \
+  --ppo-epochs 4 \
+  --minibatch-size 256 \
+  --reward-mode scaled_raw \
+  --reward-scale 0.1 \
+  --project-hours 1 6 12 24 48 \
+  --target-steps 500000 1000000 5000000 \
+  --output benchmark_results/source_cuda.json
+```
+
+ローカル動作確認:
+
+```bash
+python benchmark_source_training.py \
+  --quick \
+  --device cpu \
+  --output benchmark_results/smoke.json
+```
+
+出力JSONには次を保存する。
+
+- environment steps/秒、ALE frames/秒
+- rollout収集時間とPPO最適化時間
+- 指定時間ごとの予測steps
+- 指定stepsごとの予測時間
+- CPU/GPU、ライブラリ版、全ベンチマーク条件
+
+定期評価、checkpoint、グラフなどのディスクI/Oは測定から除外する。その
+オーバーヘッド用に既定で10%を予約し、実測値に加えてconservative予測を
+出力する。実際の学習計画にはconservative側を使用する。
+
 3 seedsを順次実行:
 
 ```bash
@@ -191,6 +275,8 @@ PYTHON_BIN=.venv/bin/python DEVICE=cuda TOTAL_STEPS=1000000 \
 - `updates.csv`: PPO loss、KL、clip fraction、勾配norm、explained variance
   および変換前後の報酬分散
 - `periodic_evaluation.csv`: 固定seedによるrandom/初期/定期/最終評価
+- `progress.json`: 実行中の最新進捗、速度、ETA
+- `progress.csv`: 進捗履歴
 - `action_distribution.csv`: PPO更新ごとの行動回数と割合
 - `object_categories.csv`: REMカテゴリの出現数と出現フレーム率
 - `object_diagnostics.json`: 自機・敵・飛翔物の検出率など
