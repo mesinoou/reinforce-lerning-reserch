@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(Path(__file__).resolve().parent / ".matplotlib"),
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -112,6 +116,12 @@ def main() -> None:
         config = read_json(config_path)
         evaluations = read_csv(evaluation_path)
         seed = int(config["arguments"]["seed"])
+        input_mode = str(
+            config.get(
+                "input_mode",
+                config["arguments"].get("input_mode", "objects"),
+            )
+        )
         random_row = last_evaluation(
             evaluations,
             "random_baseline",
@@ -133,6 +143,7 @@ def main() -> None:
         per_seed_rows.append(
             {
                 "seed": seed,
+                "input_mode": input_mode,
                 "run_directory": str(run_directory.resolve()),
                 "environment_steps": int(summary["environment_steps"]),
                 "random_raw_return": random_return,
@@ -147,6 +158,14 @@ def main() -> None:
                 "training_last_20_percent_raw_return": summary.get(
                     "training_raw_return_last_20_percent_mean",
                     float("nan"),
+                ),
+                "steps_per_second": summary.get(
+                    "steps_per_second",
+                    float("nan"),
+                ),
+                "model_parameter_count": summary.get(
+                    "model_parameter_count",
+                    config.get("model_parameter_count"),
                 ),
                 "player_detection_rate": summary["object_diagnostics"][
                     "player_detection_rate"
@@ -166,6 +185,11 @@ def main() -> None:
             curves[key].append(value)
 
     per_seed_rows.sort(key=lambda row: row["seed"])
+    input_modes = {row["input_mode"] for row in per_seed_rows}
+    if len(input_modes) != 1:
+        raise ValueError(
+            f"Runs from multiple input modes cannot be aggregated: {input_modes}"
+        )
     curve_rows: List[Dict[str, Any]] = []
     for (policy, env_steps), values in sorted(
         curves.items(),
@@ -192,6 +216,7 @@ def main() -> None:
         per_seed_rows,
         [
             "seed",
+            "input_mode",
             "run_directory",
             "environment_steps",
             "random_raw_return",
@@ -201,6 +226,8 @@ def main() -> None:
             "final_minus_initial",
             "stochastic_evaluation_auc",
             "training_last_20_percent_raw_return",
+            "steps_per_second",
+            "model_parameter_count",
             "player_detection_rate",
             "enemy_detection_rate",
         ],
@@ -235,6 +262,7 @@ def main() -> None:
     wins_over_initial = int(np.sum(final_values > initial_values))
     required_wins = math.ceil(2 * seed_count / 3)
     aggregate_summary = {
+        "input_mode": per_seed_rows[0]["input_mode"],
         "seed_count": seed_count,
         "seeds": [row["seed"] for row in per_seed_rows],
         "random_raw_return_mean": float(random_values.mean()),
@@ -284,7 +312,10 @@ def main() -> None:
         linestyle="--",
         label="random baseline mean",
     )
-    ax.set_title("Space Invaders source PPO across seeds")
+    ax.set_title(
+        "Space Invaders source PPO across seeds "
+        f"({aggregate_summary['input_mode']})"
+    )
     ax.set_xlabel("Environment steps")
     ax.set_ylabel("Evaluation raw return")
     ax.grid(True, alpha=0.25)

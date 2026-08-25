@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-08-25
+
+### Representation comparison
+
+- 共通PPO学習器へ`--input-mode objects|pixels`を追加。
+- 物体条件は従来の364次元MLP、画像条件は84×84グレースケール4フレームと
+  Atari形式CNNを使用。
+- 両条件でOCAtari/ALE transition、frameskip、報酬、PPO、評価seedを共有。
+- 画像モデルのcheckpoint、resume、最終モデル、MP4再生に対応。
+- ベンチマークを両入力条件に対応し、入力形状とパラメータ数を記録。
+- 対応seed実行用`run_representation_comparison.sh`を追加。
+- 条件一致を検証し、最終return、AUC、速度、パラメータ数をまとめる
+  `compare_representations.py`を追加。
+
 ## 2026-07-28
 
 ### Source-task baseline

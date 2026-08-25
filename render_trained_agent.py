@@ -29,7 +29,12 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from ocatari_source_ppo import maybe_fire_after_reset
+from ocatari_source_ppo import (
+    ActorCriticCNN,
+    PixelConfig,
+    PixelEnv,
+    maybe_fire_after_reset,
+)
 from ocatari_transfer_full_experiment import (
     ActorCriticMLP,
     CommonObjectEncoder,
@@ -60,12 +65,15 @@ TRAJECTORY_FIELDS = [
 
 @dataclass
 class LoadedModel:
-    model: ActorCriticMLP
+    model: torch.nn.Module
     payload: Dict[str, Any]
     encoder_config: EncoderConfig
+    pixel_config: PixelConfig
     observation_dimension: int
+    observation_shape: Tuple[int, ...]
     runtime_config: Dict[str, Any]
     env_id: str
+    input_mode: str
     object_mode: str
     frameskip: int
     repeat_action_probability: float
@@ -155,6 +163,7 @@ def resolve_model_metadata(
     runtime = dict(config.get("arguments", {}))
     runtime.update(payload.get("configuration", {}))
     encoder_data = payload.get("encoder_config") or config.get("encoder")
+    pixel_data = payload.get("pixel_config") or config.get("pixels") or {}
     ppo_data = payload.get("ppo_config") or config.get("ppo")
     if not encoder_data:
         raise ValueError(
@@ -173,8 +182,13 @@ def resolve_model_metadata(
     return {
         "runtime": runtime,
         "encoder_data": encoder_data,
+        "pixel_data": pixel_data,
         "ppo_data": ppo_data,
         "env_id": str(env_id),
+        "input_mode": str(
+            payload.get("input_mode")
+            or runtime.get("input_mode", "objects")
+        ),
         "object_mode": args.object_mode or runtime.get("object_mode", "ram"),
         "frameskip": (
             args.frameskip
@@ -221,22 +235,45 @@ def load_trained_model(
     config = read_optional_config(config_path)
     metadata = resolve_model_metadata(payload, config, args)
     encoder_config = EncoderConfig(**metadata["encoder_data"])
-    observation_dimension = CommonObjectEncoder(encoder_config).obs_dim
+    pixel_config = PixelConfig(**metadata["pixel_data"])
+    if metadata["input_mode"] == "objects":
+        observation_shape = (CommonObjectEncoder(encoder_config).obs_dim,)
+    elif metadata["input_mode"] == "pixels":
+        observation_shape = tuple(
+            int(value)
+            for value in payload.get(
+                "observation_shape",
+                pixel_config.observation_shape,
+            )
+        )
+    else:
+        raise ValueError(f"Unknown input mode: {metadata['input_mode']}")
+    observation_dimension = int(np.prod(observation_shape))
     hidden_size = int(metadata["ppo_data"].get("hidden_size", 256))
-    model = ActorCriticMLP(
-        observation_dimension,
-        metadata["n_actions"],
-        hidden_size,
-    ).to(device)
+    if metadata["input_mode"] == "objects":
+        model = ActorCriticMLP(
+            observation_dimension,
+            metadata["n_actions"],
+            hidden_size,
+        ).to(device)
+    else:
+        model = ActorCriticCNN(
+            observation_shape,
+            metadata["n_actions"],
+            hidden_size,
+        ).to(device)
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.eval()
     return LoadedModel(
         model=model,
         payload=payload,
         encoder_config=encoder_config,
+        pixel_config=pixel_config,
         observation_dimension=observation_dimension,
+        observation_shape=observation_shape,
         runtime_config=metadata["runtime"],
         env_id=metadata["env_id"],
+        input_mode=metadata["input_mode"],
         object_mode=metadata["object_mode"],
         frameskip=metadata["frameskip"],
         repeat_action_probability=metadata[
@@ -389,13 +426,23 @@ def render_episode(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(episode_seed)
 
-    env = ObjectEnv(
-        loaded.env_id,
-        loaded.encoder_config,
-        loaded.object_mode,
-        loaded.frameskip,
-        loaded.repeat_action_probability,
-    )
+    if loaded.input_mode == "objects":
+        env = ObjectEnv(
+            loaded.env_id,
+            loaded.encoder_config,
+            loaded.object_mode,
+            loaded.frameskip,
+            loaded.repeat_action_probability,
+        )
+    else:
+        env = PixelEnv(
+            loaded.env_id,
+            loaded.encoder_config,
+            loaded.object_mode,
+            loaded.frameskip,
+            loaded.repeat_action_probability,
+            loaded.pixel_config,
+        )
     trajectory_rows: List[Dict[str, Any]] = []
     reservoir = RepresentativeFrameReservoir(
         args.max_representative_frames,
@@ -698,8 +745,8 @@ def main() -> None:
     print(f"Model: {model_path}")
     print(f"Environment: {loaded.env_id}")
     print(
-        f"Object mode: {loaded.object_mode}, "
-        f"observation dimension: {loaded.observation_dimension}"
+        f"Input mode: {loaded.input_mode}, object mode: {loaded.object_mode}, "
+        f"observation shape: {loaded.observation_shape}"
     )
     print(
         f"Policy: {args.policy}, episodes: {args.episodes}, "
@@ -739,10 +786,12 @@ def main() -> None:
         "config_path": str(config_path) if config_path is not None else None,
         "source_training_steps": loaded.source_steps,
         "environment": loaded.env_id,
+        "input_mode": loaded.input_mode,
         "object_mode": loaded.object_mode,
         "frameskip": loaded.frameskip,
         "repeat_action_probability": loaded.repeat_action_probability,
         "observation_dimension": loaded.observation_dimension,
+        "observation_shape": list(loaded.observation_shape),
         "action_count": loaded.n_actions,
         "saved_action_meanings": loaded.action_meanings,
         "policy": args.policy,

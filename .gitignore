@@ -6,6 +6,7 @@
 .smoke_*/
 source_results_*/
 source_baseline_runs/
+representation_comparison_runs/
 benchmark_source_*.json
 benchmark_results/
 playback_*/

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark OCAtari object-centric PPO throughput.
+"""Benchmark object-list or pixel PPO throughput.
 
-The benchmark executes the same environment interaction, REM encoding, policy
-inference, GAE, and PPO optimization used by the source trainer. It then
+The benchmark executes the same environment interaction, observation encoding,
+policy inference, GAE, and PPO optimization used by the source trainer. It then
 converts measured wall-clock throughput into:
 
 - environment steps achievable within user-specified training hours
@@ -39,20 +39,22 @@ import torch.optim as optim
 from ocatari_source_ppo import (
     ObjectDiagnostics,
     ObservationStatistics,
+    PixelConfig,
     PPOConfig,
     RewardConfig,
     RolloutBuffer,
     count_ale_frames_advanced,
     format_duration,
     maybe_fire_after_reset,
+    make_actor_critic,
+    make_observation_env,
+    model_parameter_count,
     ppo_update,
     reward_components,
     set_global_seed,
 )
 from ocatari_transfer_full_experiment import (
-    ActorCriticMLP,
     EncoderConfig,
-    ObjectEnv,
     module_version,
     save_json,
 )
@@ -74,9 +76,9 @@ def synchronize(device: torch.device) -> None:
 
 def one_training_update(
     *,
-    env: ObjectEnv,
+    env: Any,
     state: EnvironmentState,
-    model: ActorCriticMLP,
+    model: torch.nn.Module,
     optimizer: optim.Optimizer,
     buffer: RolloutBuffer,
     encoder_config: EncoderConfig,
@@ -96,7 +98,11 @@ def one_training_update(
     for _step in range(ppo_config.rollout_steps):
         obs = state.observation
         if observation_statistics is not None:
-            observation_statistics.update(obs, encoder_config.stack_size)
+            observation_statistics.update(
+                obs,
+                args.stack_size,
+                summarize_pixels=args.input_mode == "pixels",
+            )
         if object_diagnostics is not None:
             object_diagnostics.update(env)
 
@@ -264,11 +270,16 @@ def projection_rows(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark OCAtari REM + PPO throughput and convert training "
+            "Benchmark object-list or pixel PPO throughput and convert training "
             "time to environment steps."
         )
     )
     parser.add_argument("--env", default="ALE/SpaceInvaders-v5")
+    parser.add_argument(
+        "--input-mode",
+        choices=["objects", "pixels"],
+        default="objects",
+    )
     parser.add_argument("--object-mode", choices=["ram", "vision"], default="ram")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
@@ -298,6 +309,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frameskip", type=int, default=4)
     parser.add_argument("--repeat-action-probability", type=float, default=0.0)
     parser.add_argument("--stack-size", type=int, default=4)
+    parser.add_argument("--pixel-width", type=int, default=84)
+    parser.add_argument("--pixel-height", type=int, default=84)
     parser.add_argument("--max-enemies", type=int, default=12)
     parser.add_argument("--max-projectiles", type=int, default=4)
     parser.add_argument(
@@ -382,6 +395,11 @@ def main() -> None:
         slot_strategy=args.slot_strategy,
         slot_match_distance=args.slot_match_distance,
     )
+    pixel_config = PixelConfig(
+        width=args.pixel_width,
+        height=args.pixel_height,
+        stack_size=args.stack_size,
+    )
     ppo_config = PPOConfig(
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
@@ -405,12 +423,14 @@ def main() -> None:
         survival_reward_per_frame=args.survival_reward_per_frame,
         life_loss_penalty=args.life_loss_penalty,
     )
-    env = ObjectEnv(
-        args.env,
-        encoder_config,
-        args.object_mode,
-        args.frameskip,
-        args.repeat_action_probability,
+    env = make_observation_env(
+        input_mode=args.input_mode,
+        env_id=args.env,
+        encoder_config=encoder_config,
+        object_mode=args.object_mode,
+        frameskip=args.frameskip,
+        repeat_action_probability=args.repeat_action_probability,
+        pixel_config=pixel_config,
     )
     try:
         observation, info = env.reset(seed=args.seed)
@@ -430,19 +450,28 @@ def main() -> None:
                 else None
             ),
         )
-        model = ActorCriticMLP(
-            env.obs_dim,
-            int(env.action_space.n),
-            ppo_config.hidden_size,
+        observation_shape = tuple(
+            int(value)
+            for value in getattr(env, "obs_shape", (env.obs_dim,))
+        )
+        model = make_actor_critic(
+            input_mode=args.input_mode,
+            observation_shape=observation_shape,
+            n_actions=int(env.action_space.n),
+            hidden_size=ppo_config.hidden_size,
         ).to(device)
         optimizer = optim.Adam(
             model.parameters(),
             lr=ppo_config.learning_rate,
             eps=1e-5,
         )
-        buffer = RolloutBuffer(ppo_config.rollout_steps, env.obs_dim)
+        buffer = RolloutBuffer(ppo_config.rollout_steps, observation_shape)
         observation_statistics = (
-            ObservationStatistics(env.obs_dim)
+            ObservationStatistics(
+                env.obs_dim
+                if args.input_mode == "objects"
+                else args.stack_size * 5
+            )
             if args.include_diagnostics
             else None
         )
@@ -451,7 +480,8 @@ def main() -> None:
         )
 
         print(
-            f"Benchmark device={device} rollout={ppo_config.rollout_steps} "
+            f"Benchmark input={args.input_mode} device={device} "
+            f"rollout={ppo_config.rollout_steps} "
             f"epochs={ppo_config.ppo_epochs} diagnostics={args.include_diagnostics}"
         )
         for warmup_index in range(args.warmup_updates):
@@ -553,10 +583,17 @@ def main() -> None:
             },
             "configuration": {
                 "arguments": vars(args),
+                "input_mode": args.input_mode,
+                "model_type": (
+                    "cnn" if args.input_mode == "pixels" else "mlp"
+                ),
                 "encoder": asdict(encoder_config),
+                "pixels": asdict(pixel_config),
                 "ppo": asdict(ppo_config),
                 "reward": asdict(reward_config),
                 "observation_dimension": env.obs_dim,
+                "observation_shape": list(observation_shape),
+                "model_parameter_count": model_parameter_count(model),
                 "action_count": int(env.action_space.n),
                 "action_meanings": env.action_meanings(),
             },
@@ -579,7 +616,7 @@ def main() -> None:
                 ),
             },
             "notes": [
-                "Includes REM extraction, object encoding, policy inference, GAE, PPO optimization, and optional in-memory diagnostics.",
+                "Includes the selected observation representation, policy inference, GAE, PPO optimization, and optional in-memory diagnostics.",
                 "Excludes periodic evaluation, checkpoint writes, plotting, and other disk I/O.",
                 "Use the conservative projection to reserve time for excluded overhead.",
                 "Run this benchmark on the same Linux PC, CUDA device, and PPO configuration as the planned training.",
