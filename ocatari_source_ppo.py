@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Train and diagnose a source-only object-centric PPO agent on OCAtari REM.
+"""Train and compare object-list and pixel PPO agents on OCAtari.
 
 This program deliberately excludes transfer learning. Its only purpose is to
-establish that PPO can learn Space Invaders from the common object-centric
-representation before source knowledge is used by a target task.
+establish whether PPO learns Space Invaders more effectively from the common
+object-centric representation than from pixels before source knowledge is used
+by a target task.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from PIL import Image
 
 from ocatari_transfer_full_experiment import (
     ActorCriticMLP,
@@ -151,6 +153,177 @@ class RewardConfig:
 
 
 @dataclass(frozen=True)
+class PixelConfig:
+    width: int = 84
+    height: int = 84
+    stack_size: int = 4
+
+    @property
+    def observation_shape(self) -> Tuple[int, int, int]:
+        return (self.stack_size, self.height, self.width)
+
+
+def preprocess_pixel_frame(
+    rgb_frame: np.ndarray,
+    pixel_config: PixelConfig,
+) -> np.ndarray:
+    rgb = np.asarray(rgb_frame, dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[-1] < 3:
+        raise ValueError(f"Unexpected RGB frame shape: {rgb.shape}")
+    image = Image.fromarray(rgb[..., :3]).convert("L").resize(
+        (pixel_config.width, pixel_config.height),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+class PixelEnv:
+    """Expose screen pixels while preserving the ObjectEnv ALE transition path.
+
+    Both representation conditions therefore use the same OCAtari wrapper,
+    frameskip, action space, reset behavior, rewards, and termination signals.
+    Object extraction still occurs internally, but no object feature is passed
+    to the pixel policy.
+    """
+
+    def __init__(
+        self,
+        env_id: str,
+        encoder_config: EncoderConfig,
+        object_mode: str,
+        frameskip: int,
+        repeat_action_probability: float,
+        pixel_config: PixelConfig,
+    ) -> None:
+        self.base_env = ObjectEnv(
+            env_id,
+            encoder_config,
+            object_mode,
+            frameskip,
+            repeat_action_probability,
+        )
+        self.pixel_config = pixel_config
+        self.action_space = self.base_env.action_space
+        self.obs_shape = pixel_config.observation_shape
+        self.obs_dim = int(np.prod(self.obs_shape))
+        self._frames: List[np.ndarray] = []
+        self.current_obs: Optional[np.ndarray] = None
+
+    @property
+    def encoder(self) -> Any:
+        return self.base_env.encoder
+
+    @property
+    def objects(self) -> List[Any]:
+        return self.base_env.objects
+
+    def action_meanings(self) -> List[str]:
+        return self.base_env.action_meanings()
+
+    def _preprocess_frame(self) -> np.ndarray:
+        return preprocess_pixel_frame(
+            self.base_env.rgb_frame(),
+            self.pixel_config,
+        )
+
+    def _stacked_observation(self) -> np.ndarray:
+        observation = np.stack(self._frames, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
+        if observation.shape != self.obs_shape:
+            raise RuntimeError(
+                f"Unexpected pixel observation shape: {observation.shape}, "
+                f"expected {self.obs_shape}"
+            )
+        self.current_obs = observation
+        return observation.copy()
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        _object_observation, info = self.base_env.reset(seed=seed)
+        frame = self._preprocess_frame()
+        self._frames = [frame.copy() for _ in range(self.pixel_config.stack_size)]
+        return self._stacked_observation(), info
+
+    def step(
+        self,
+        action: int,
+    ) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        _object_observation, reward, done, info = self.base_env.step(action)
+        self._frames.append(self._preprocess_frame())
+        self._frames = self._frames[-self.pixel_config.stack_size :]
+        return self._stacked_observation(), reward, done, info
+
+    def rgb_frame(self) -> np.ndarray:
+        return self.base_env.rgb_frame()
+
+    def close(self) -> None:
+        self.base_env.close()
+
+    def save_detection_snapshot(self, path: Path, title: str) -> None:
+        self.base_env.save_detection_snapshot(path, title)
+
+
+class ActorCriticCNN(nn.Module):
+    """Atari-style CNN with the same PPO policy/value interface as the MLP."""
+
+    def __init__(
+        self,
+        observation_shape: Sequence[int],
+        n_actions: int,
+        hidden_size: int = 256,
+    ) -> None:
+        super().__init__()
+        shape = tuple(int(value) for value in observation_shape)
+        if len(shape) != 3:
+            raise ValueError(f"CNN observation shape must be CxHxW, got {shape}")
+        channels, height, width = shape
+        self.observation_shape = shape
+        self.convolution = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            convolution_size = int(
+                self.convolution(torch.zeros(1, channels, height, width))
+                .flatten(start_dim=1)
+                .shape[1]
+            )
+        self.backbone = nn.Sequential(
+            nn.Linear(convolution_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(hidden_size, n_actions)
+        self.value_head = nn.Linear(hidden_size, 1)
+        self.apply(self._init_layer)
+        nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+
+    @staticmethod
+    def _init_layer(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if obs.ndim != 4:
+            raise ValueError(
+                f"CNN observations must be batched CxHxW tensors, got {obs.shape}"
+            )
+        features = self.convolution(obs).flatten(start_dim=1)
+        latent = self.backbone(features)
+        return self.policy_head(latent), self.value_head(latent).squeeze(-1)
+
+
+@dataclass(frozen=True)
 class RewardComponents:
     score: float
     survival: float
@@ -246,9 +419,25 @@ def make_progress_row(
 
 
 class RolloutBuffer:
-    def __init__(self, capacity: int, obs_dim: int):
+    def __init__(
+        self,
+        capacity: int,
+        observation_shape: int | Sequence[int],
+    ):
         self.capacity = capacity
-        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.observation_shape = (
+            (int(observation_shape),)
+            if isinstance(observation_shape, int)
+            else tuple(int(value) for value in observation_shape)
+        )
+        if not self.observation_shape or any(
+            value <= 0 for value in self.observation_shape
+        ):
+            raise ValueError("observation_shape must contain positive values")
+        self.obs = np.zeros(
+            (capacity, *self.observation_shape),
+            dtype=np.float32,
+        )
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.raw_rewards = np.zeros(capacity, dtype=np.float32)
@@ -329,8 +518,28 @@ class ObservationStatistics:
         self.nonzero_count = np.zeros(dimension, dtype=np.int64)
         self.identical_stack_count = 0
 
-    def update(self, observation: np.ndarray, stack_size: int) -> None:
-        value = np.asarray(observation, dtype=np.float64)
+    def update(
+        self,
+        observation: np.ndarray,
+        stack_size: int,
+        *,
+        summarize_pixels: bool = False,
+    ) -> None:
+        raw_value = np.asarray(observation, dtype=np.float64)
+        frames = raw_value.reshape(stack_size, -1)
+        if summarize_pixels:
+            value = np.stack(
+                [
+                    frames.mean(axis=1),
+                    frames.std(axis=1, ddof=0),
+                    frames.min(axis=1),
+                    frames.max(axis=1),
+                    np.count_nonzero(frames, axis=1) / frames.shape[1],
+                ],
+                axis=1,
+            ).reshape(-1)
+        else:
+            value = raw_value.reshape(-1)
         if value.shape != (self.dimension,):
             raise ValueError(
                 f"Observation shape changed: {value.shape}, expected {(self.dimension,)}"
@@ -344,7 +553,6 @@ class ObservationStatistics:
         self.minimum = np.minimum(self.minimum, value)
         self.maximum = np.maximum(self.maximum, value)
         self.nonzero_count += value != 0.0
-        frames = value.reshape(stack_size, -1)
         if np.allclose(frames, frames[0], rtol=0.0, atol=1e-7):
             self.identical_stack_count += 1
 
@@ -584,7 +792,7 @@ def explained_variance(prediction: np.ndarray, target: np.ndarray) -> float:
 
 
 def ppo_update(
-    model: ActorCriticMLP,
+    model: nn.Module,
     optimizer: optim.Optimizer,
     obs: torch.Tensor,
     actions: torch.Tensor,
@@ -743,7 +951,85 @@ def feature_names(config: EncoderConfig) -> List[str]:
     ]
 
 
-def visible_object_sample(env: ObjectEnv) -> List[Dict[str, Any]]:
+def observation_feature_names(
+    input_mode: str,
+    encoder_config: EncoderConfig,
+    pixel_config: PixelConfig,
+) -> List[str]:
+    if input_mode == "objects":
+        return feature_names(encoder_config)
+    if input_mode == "pixels":
+        return [
+            f"frame[{frame_index}].{statistic}"
+            for frame_index in range(pixel_config.stack_size)
+            for statistic in (
+                "pixel_mean",
+                "pixel_std",
+                "pixel_min",
+                "pixel_max",
+                "pixel_nonzero_rate",
+            )
+        ]
+    raise ValueError(f"Unknown input mode: {input_mode}")
+
+
+def make_observation_env(
+    *,
+    input_mode: str,
+    env_id: str,
+    encoder_config: EncoderConfig,
+    object_mode: str,
+    frameskip: int,
+    repeat_action_probability: float,
+    pixel_config: PixelConfig,
+) -> Any:
+    if input_mode == "objects":
+        return ObjectEnv(
+            env_id,
+            encoder_config,
+            object_mode,
+            frameskip,
+            repeat_action_probability,
+        )
+    if input_mode == "pixels":
+        return PixelEnv(
+            env_id,
+            encoder_config,
+            object_mode,
+            frameskip,
+            repeat_action_probability,
+            pixel_config,
+        )
+    raise ValueError(f"Unknown input mode: {input_mode}")
+
+
+def make_actor_critic(
+    *,
+    input_mode: str,
+    observation_shape: Sequence[int],
+    n_actions: int,
+    hidden_size: int,
+) -> nn.Module:
+    if input_mode == "objects":
+        return ActorCriticMLP(
+            int(np.prod(tuple(observation_shape))),
+            n_actions,
+            hidden_size,
+        )
+    if input_mode == "pixels":
+        return ActorCriticCNN(
+            observation_shape,
+            n_actions,
+            hidden_size,
+        )
+    raise ValueError(f"Unknown input mode: {input_mode}")
+
+
+def model_parameter_count(model: nn.Module) -> int:
+    return int(sum(parameter.numel() for parameter in model.parameters()))
+
+
+def visible_object_sample(env: Any) -> List[Dict[str, Any]]:
     objects: List[Dict[str, Any]] = []
     for obj in env.objects:
         try:
@@ -790,9 +1076,11 @@ def maybe_fire_after_reset(
 @torch.no_grad()
 def evaluate(
     *,
-    model: Optional[ActorCriticMLP],
+    model: Optional[nn.Module],
     env_id: str,
+    input_mode: str,
     encoder_config: EncoderConfig,
+    pixel_config: PixelConfig,
     object_mode: str,
     frameskip: int,
     repeat_action_probability: float,
@@ -812,12 +1100,14 @@ def evaluate(
     was_training = bool(model.training) if model is not None else False
     if model is not None:
         model.eval()
-    env = ObjectEnv(
-        env_id,
-        encoder_config,
-        object_mode,
-        frameskip,
-        repeat_action_probability,
+    env = make_observation_env(
+        input_mode=input_mode,
+        env_id=env_id,
+        encoder_config=encoder_config,
+        object_mode=object_mode,
+        frameskip=frameskip,
+        repeat_action_probability=repeat_action_probability,
+        pixel_config=pixel_config,
     )
     random_generator = np.random.default_rng(seed)
     returns: List[float] = []
@@ -878,9 +1168,10 @@ def append_evaluation_rows(
     *,
     stage: str,
     env_steps: int,
-    model: ActorCriticMLP,
+    model: nn.Module,
     args: argparse.Namespace,
     encoder_config: EncoderConfig,
+    pixel_config: PixelConfig,
     device: torch.device,
 ) -> List[Dict[str, Any]]:
     new_rows: List[Dict[str, Any]] = []
@@ -888,7 +1179,9 @@ def append_evaluation_rows(
         result = evaluate(
             model=model,
             env_id=args.env,
+            input_mode=args.input_mode,
             encoder_config=encoder_config,
+            pixel_config=pixel_config,
             object_mode=args.object_mode,
             frameskip=args.frameskip,
             repeat_action_probability=args.repeat_action_probability,
@@ -918,10 +1211,13 @@ def append_evaluation_rows(
 def save_checkpoint(
     path: Path,
     *,
-    model: ActorCriticMLP,
+    model: nn.Module,
     optimizer: optim.Optimizer,
     args: argparse.Namespace,
     encoder_config: EncoderConfig,
+    pixel_config: PixelConfig,
+    observation_shape: Sequence[int],
+    observation_dimension: int,
     ppo_config: PPOConfig,
     reward_config: RewardConfig,
     env_steps: int,
@@ -941,7 +1237,7 @@ def save_checkpoint(
     ensure_dir(path.parent)
     torch.save(
         {
-            "format_version": 1,
+            "format_version": 2,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "environment_steps": env_steps,
@@ -950,17 +1246,16 @@ def save_checkpoint(
             "best_evaluation_return": best_evaluation_return,
             "rng_state": capture_rng_state(),
             "configuration": vars(args),
+            "input_mode": args.input_mode,
+            "model_type": "cnn" if args.input_mode == "pixels" else "mlp",
             "encoder_config": asdict(encoder_config),
+            "pixel_config": asdict(pixel_config),
             "ppo_config": asdict(ppo_config),
             "reward_config": asdict(reward_config),
             "env_id": args.env,
-            "obs_dim": encoder_config.stack_size
-            * (
-                5
-                + encoder_config.max_enemies * 5
-                + encoder_config.max_projectiles * 5
-                + 6
-            ),
+            "obs_dim": observation_dimension,
+            "observation_shape": list(observation_shape),
+            "model_parameter_count": model_parameter_count(model),
             "n_actions": n_actions,
             "action_meanings": action_meanings,
             "episode_logs": episode_rows,
@@ -985,6 +1280,8 @@ def save_progress_files(
     observation_statistics: ObservationStatistics,
     object_diagnostics: ObjectDiagnostics,
     encoder_config: EncoderConfig,
+    pixel_config: PixelConfig,
+    input_mode: str,
 ) -> None:
     save_csv(output_dir / "episodes.csv", episode_rows, EPISODE_FIELDS)
     save_csv(output_dir / "updates.csv", update_rows, UPDATE_FIELDS)
@@ -1014,7 +1311,13 @@ def save_progress_files(
             "frame_presence_rate",
         ],
     )
-    observation_rows = observation_statistics.rows(feature_names(encoder_config))
+    observation_rows = observation_statistics.rows(
+        observation_feature_names(
+            input_mode,
+            encoder_config,
+            pixel_config,
+        )
+    )
     save_csv(
         output_dir / "observation_statistics.csv",
         observation_rows,
@@ -1023,6 +1326,7 @@ def save_progress_files(
     summary = object_diagnostics.summary()
     summary.update(
         {
+            "input_mode": input_mode,
             "observation_count": observation_statistics.count,
             "identical_four_frame_stack_rate": (
                 observation_statistics.identical_stack_count
@@ -1177,6 +1481,8 @@ def final_summary(
     env_steps: int,
     elapsed_seconds: float,
     object_diagnostics: ObjectDiagnostics,
+    observation_shape: Sequence[int],
+    parameter_count: int,
 ) -> Dict[str, Any]:
     random_rows = [
         row for row in evaluation_rows if row["policy"] == "random"
@@ -1207,6 +1513,9 @@ def final_summary(
             (env_steps - starting_env_steps) / max(elapsed_seconds, 1e-9)
         ),
         "reward_mode": args.reward_mode,
+        "input_mode": args.input_mode,
+        "observation_shape": list(observation_shape),
+        "model_parameter_count": parameter_count,
         "slot_strategy": args.slot_strategy,
         "object_diagnostics": object_diagnostics.summary(),
     }
@@ -1361,6 +1670,11 @@ def train(args: argparse.Namespace) -> Path:
         slot_strategy=args.slot_strategy,
         slot_match_distance=args.slot_match_distance,
     )
+    pixel_config = PixelConfig(
+        width=args.pixel_width,
+        height=args.pixel_height,
+        stack_size=args.stack_size,
+    )
     ppo_config = PPOConfig(
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
@@ -1387,12 +1701,14 @@ def train(args: argparse.Namespace) -> Path:
         death_penalty=args.death_penalty,
     )
 
-    env = ObjectEnv(
-        args.env,
-        encoder_config,
-        args.object_mode,
-        args.frameskip,
-        args.repeat_action_probability,
+    env = make_observation_env(
+        input_mode=args.input_mode,
+        env_id=args.env,
+        encoder_config=encoder_config,
+        object_mode=args.object_mode,
+        frameskip=args.frameskip,
+        repeat_action_probability=args.repeat_action_probability,
+        pixel_config=pixel_config,
     )
     obs, info = env.reset(seed=args.seed)
     obs, info = maybe_fire_after_reset(
@@ -1403,18 +1719,25 @@ def train(args: argparse.Namespace) -> Path:
     )
     n_actions = int(env.action_space.n)
     action_meanings = env.action_meanings()
-    model = ActorCriticMLP(
-        env.obs_dim,
-        n_actions,
-        ppo_config.hidden_size,
+    observation_shape = tuple(
+        int(value)
+        for value in getattr(env, "obs_shape", (env.obs_dim,))
+    )
+    model = make_actor_critic(
+        input_mode=args.input_mode,
+        observation_shape=observation_shape,
+        n_actions=n_actions,
+        hidden_size=ppo_config.hidden_size,
     ).to(device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=ppo_config.learning_rate,
         eps=1e-5,
     )
-    buffer = RolloutBuffer(ppo_config.rollout_steps, env.obs_dim)
-    observation_statistics = ObservationStatistics(env.obs_dim)
+    buffer = RolloutBuffer(ppo_config.rollout_steps, observation_shape)
+    observation_statistics = ObservationStatistics(
+        env.obs_dim if args.input_mode == "objects" else args.stack_size * 5
+    )
     object_diagnostics = ObjectDiagnostics()
     episode_rows: List[Dict[str, Any]] = []
     update_rows: List[Dict[str, Any]] = []
@@ -1436,8 +1759,26 @@ def train(args: argparse.Namespace) -> Path:
             raise ValueError(
                 f"Resume environment mismatch: {checkpoint['env_id']} != {args.env}"
             )
+        checkpoint_input_mode = checkpoint.get("input_mode", "objects")
+        if checkpoint_input_mode != args.input_mode:
+            raise ValueError(
+                "Resume input-mode mismatch: "
+                f"{checkpoint_input_mode} != {args.input_mode}"
+            )
         if int(checkpoint["obs_dim"]) != env.obs_dim:
             raise ValueError("Resume observation-dimension mismatch")
+        checkpoint_shape = tuple(
+            int(value)
+            for value in checkpoint.get(
+                "observation_shape",
+                [checkpoint["obs_dim"]],
+            )
+        )
+        if checkpoint_shape != observation_shape:
+            raise ValueError(
+                "Resume observation-shape mismatch: "
+                f"{checkpoint_shape} != {observation_shape}"
+            )
         if int(checkpoint["n_actions"]) != n_actions:
             raise ValueError("Resume action-space mismatch")
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -1492,11 +1833,16 @@ def train(args: argparse.Namespace) -> Path:
         output_dir / "config.json",
         {
             "arguments": vars(args),
+            "input_mode": args.input_mode,
+            "model_type": "cnn" if args.input_mode == "pixels" else "mlp",
             "encoder": asdict(encoder_config),
+            "pixels": asdict(pixel_config),
             "ppo": asdict(ppo_config),
             "reward": asdict(reward_config),
             "versions": versions,
             "observation_dimension": env.obs_dim,
+            "observation_shape": list(observation_shape),
+            "model_parameter_count": model_parameter_count(model),
             "action_count": n_actions,
             "action_meanings": action_meanings,
         },
@@ -1504,7 +1850,7 @@ def train(args: argparse.Namespace) -> Path:
     try:
         env.save_detection_snapshot(
             output_dir / "object_detection_snapshot.png",
-            f"Source PPO REM: {args.env}",
+            f"Source PPO {args.input_mode}: {args.env}",
         )
     except Exception as exc:
         print(f"Warning: object snapshot could not be saved: {exc}")
@@ -1512,9 +1858,10 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Output directory: {output_dir.resolve()}")
     print(f"Device: {device}")
     print(
-        f"Observation: {env.obs_dim} dimensions, "
-        f"slot_strategy={args.slot_strategy}"
+        f"Observation: mode={args.input_mode}, shape={observation_shape}, "
+        f"dimensions={env.obs_dim}"
     )
+    print(f"Model parameters: {model_parameter_count(model):,}")
     print(f"Actions: {n_actions} {action_meanings}")
     print(f"Training reward: {args.reward_mode}; raw return is logged separately")
 
@@ -1522,7 +1869,9 @@ def train(args: argparse.Namespace) -> Path:
         random_result = evaluate(
             model=None,
             env_id=args.env,
+            input_mode=args.input_mode,
             encoder_config=encoder_config,
+            pixel_config=pixel_config,
             object_mode=args.object_mode,
             frameskip=args.frameskip,
             repeat_action_probability=args.repeat_action_probability,
@@ -1553,6 +1902,7 @@ def train(args: argparse.Namespace) -> Path:
             model=model,
             args=args,
             encoder_config=encoder_config,
+            pixel_config=pixel_config,
             device=device,
         )
 
@@ -1635,19 +1985,25 @@ def train(args: argparse.Namespace) -> Path:
             rollout_action_counts = np.zeros(n_actions, dtype=np.int64)
 
             for _ in range(rollout_target):
-                observation_statistics.update(obs, encoder_config.stack_size)
+                observation_statistics.update(
+                    obs,
+                    args.stack_size,
+                    summarize_pixels=args.input_mode == "pixels",
+                )
                 object_diagnostics.update(env)
                 if len(object_samples) < args.object_sample_frames:
-                    object_samples.append(
-                        {
-                            "env_step": global_steps,
-                            "objects": visible_object_sample(env),
-                            "observation_nonzero_count": int(
-                                np.count_nonzero(obs)
-                            ),
-                            "encoded_observation": obs.tolist(),
-                        }
-                    )
+                    sample: Dict[str, Any] = {
+                        "env_step": global_steps,
+                        "input_mode": args.input_mode,
+                        "objects": visible_object_sample(env),
+                        "observation_shape": list(obs.shape),
+                        "observation_nonzero_count": int(np.count_nonzero(obs)),
+                        "observation_mean": float(np.mean(obs)),
+                        "observation_std": float(np.std(obs, ddof=0)),
+                    }
+                    if args.input_mode == "objects":
+                        sample["encoded_observation"] = obs.tolist()
+                    object_samples.append(sample)
 
                 observation_tensor = (
                     torch.from_numpy(obs).unsqueeze(0).to(device)
@@ -1939,6 +2295,7 @@ def train(args: argparse.Namespace) -> Path:
                     model=model,
                     args=args,
                     encoder_config=encoder_config,
+                    pixel_config=pixel_config,
                     device=device,
                 )
                 deterministic_return = next(
@@ -1954,6 +2311,9 @@ def train(args: argparse.Namespace) -> Path:
                         optimizer=optimizer,
                         args=args,
                         encoder_config=encoder_config,
+                        pixel_config=pixel_config,
+                        observation_shape=observation_shape,
+                        observation_dimension=env.obs_dim,
                         ppo_config=ppo_config,
                         reward_config=reward_config,
                         env_steps=global_steps,
@@ -1987,6 +2347,8 @@ def train(args: argparse.Namespace) -> Path:
                     observation_statistics,
                     object_diagnostics,
                     encoder_config,
+                    pixel_config,
+                    args.input_mode,
                 )
                 save_checkpoint(
                     output_dir / "checkpoint_latest.pt",
@@ -1994,6 +2356,9 @@ def train(args: argparse.Namespace) -> Path:
                     optimizer=optimizer,
                     args=args,
                     encoder_config=encoder_config,
+                    pixel_config=pixel_config,
+                    observation_shape=observation_shape,
+                    observation_dimension=env.obs_dim,
                     ppo_config=ppo_config,
                     reward_config=reward_config,
                     env_steps=global_steps,
@@ -2027,6 +2392,7 @@ def train(args: argparse.Namespace) -> Path:
             model=model,
             args=args,
             encoder_config=encoder_config,
+            pixel_config=pixel_config,
             device=device,
         )
         elapsed_seconds = time.time() - start_time
@@ -2040,16 +2406,26 @@ def train(args: argparse.Namespace) -> Path:
             observation_statistics,
             object_diagnostics,
             encoder_config,
+            pixel_config,
+            args.input_mode,
         )
         save_json(output_dir / "object_samples.json", object_samples)
         torch.save(
             {
+                "format_version": 2,
                 "model_state_dict": model.state_dict(),
                 "env_id": args.env,
+                "input_mode": args.input_mode,
+                "model_type": (
+                    "cnn" if args.input_mode == "pixels" else "mlp"
+                ),
                 "obs_dim": env.obs_dim,
+                "observation_shape": list(observation_shape),
+                "model_parameter_count": model_parameter_count(model),
                 "n_actions": n_actions,
                 "action_meanings": action_meanings,
                 "encoder_config": asdict(encoder_config),
+                "pixel_config": asdict(pixel_config),
                 "ppo_config": asdict(ppo_config),
                 "reward_config": asdict(reward_config),
                 "steps": global_steps,
@@ -2063,6 +2439,9 @@ def train(args: argparse.Namespace) -> Path:
             optimizer=optimizer,
             args=args,
             encoder_config=encoder_config,
+            pixel_config=pixel_config,
+            observation_shape=observation_shape,
+            observation_dimension=env.obs_dim,
             ppo_config=ppo_config,
             reward_config=reward_config,
             env_steps=global_steps,
@@ -2088,6 +2467,8 @@ def train(args: argparse.Namespace) -> Path:
             env_steps=global_steps,
             elapsed_seconds=elapsed_seconds,
             object_diagnostics=object_diagnostics,
+            observation_shape=observation_shape,
+            parameter_count=model_parameter_count(model),
         )
         save_json(output_dir / "summary.json", summary)
         plot_results(
@@ -2120,11 +2501,17 @@ def nonnegative_int(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train source-only PPO on an OCAtari REM object representation. "
-            "Transfer learning is intentionally not run."
+            "Train source-only PPO using either OCAtari objects or screen "
+            "pixels. Transfer learning is intentionally not run."
         )
     )
     parser.add_argument("--env", default="ALE/SpaceInvaders-v5")
+    parser.add_argument(
+        "--input-mode",
+        choices=["objects", "pixels"],
+        default="objects",
+        help="Policy input representation; all PPO conditions remain shared.",
+    )
     parser.add_argument(
         "--object-mode",
         choices=["ram", "vision"],
@@ -2153,6 +2540,8 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
     )
     parser.add_argument("--stack-size", type=positive_int, default=4)
+    parser.add_argument("--pixel-width", type=positive_int, default=84)
+    parser.add_argument("--pixel-height", type=positive_int, default=84)
     parser.add_argument("--max-enemies", type=positive_int, default=12)
     parser.add_argument("--max-projectiles", type=positive_int, default=4)
     parser.add_argument(

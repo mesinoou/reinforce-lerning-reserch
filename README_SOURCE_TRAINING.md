@@ -1,17 +1,46 @@
 # OCAtari source-task PPO
 
-転移学習へ進む前に、OCAtari REMの物体中心表現だけでSpace Invadersの
-PPO学習が成立するかを確認するためのプログラムである。
+転移学習へ進む前に、Space InvadersにおいてOCAtari REMの物体中心表現と
+画像表現を同じPPO条件で比較するためのプログラムである。
 
 ## 実験条件
 
 - 環境: `ALE/SpaceInvaders-v5`
-- 物体抽出: OCAtari RAM Extraction Mode（REM）
-- 入力: 91次元/フレーム × 4フレーム = 364次元
+- 物体入力: OCAtari REM、91次元/フレーム × 4 = 364次元
+- 画像入力: 84×84グレースケール × 4フレーム、`[0, 1]`正規化
+- 物体モデル: 2層MLP
+- 画像モデル: Atari形式CNN
 - 物体スロット: 前フレームとの最近傍対応を取る`temporal`
 - 学習報酬の既定値: `scaled_raw`（raw reward × 0.1）
 - 評価・判定に使う報酬: 加工前のraw return
 - 転移学習: 実行しない
+
+2条件とも同じOCAtari/ALE transition、action space、frameskip、報酬、
+終了条件、PPO更新、評価seedを使用する。画像条件ではOCAtari内部の物体抽出は
+動作するが、方策へ物体特徴は渡さず画面だけを入力する。この比較は画像認識誤差を
+除外したoracle物体表現の効果を測るものである。
+
+## 物体入力と画像入力の対応比較
+
+Linux研究用PCで各条件3 seedsを順次実行する。
+
+```bash
+chmod +x run_representation_comparison.sh
+PYTHON_BIN=.venv/bin/python DEVICE=cuda TOTAL_STEPS=1000000 \
+  SEEDS="0 1 2" ./run_representation_comparison.sh
+```
+
+実行順はseedごとに`objects`、`pixels`を対応させる。すべて完了すると
+`representation_comparison_runs/comparison`へ次を保存する。
+
+- `representation_per_seed.csv`: 対応seedごとの最終return、AUC、差
+- `representation_curve.csv`: 条件別の評価曲線平均、標準偏差、SEM
+- `representation_summary.json`: 共通条件の検証結果と対応差の要約
+- `representation_comparison.png`: 学習曲線と最終性能の対応比較
+
+比較器はsteps、報酬、PPO、評価条件が一致しないrunをエラーにする。主評価は
+同じenvironment stepsでのraw returnと学習曲線AUCとし、steps/秒とモデル
+パラメータ数は計算コストの副指標として記録する。
 
 ## Linux研究用PCの準備
 
@@ -56,6 +85,7 @@ python -m unittest -v test_ocatari_source_ppo.py
 ```bash
 python ocatari_source_ppo.py \
   --env ALE/SpaceInvaders-v5 \
+  --input-mode objects \
   --object-mode ram \
   --total-steps 1000000 \
   --seed 0 \
@@ -119,6 +149,22 @@ GAE、PPO更新、メモリ上の診断処理を一定時間実行する。そ�
 指定時間で学習可能なenvironment stepsと、目標stepsの所要時間を計算する。
 
 Linux研究用PCでは本学習と同じCUDA・PPO条件で実行する。
+
+表現比較では`objects`と`pixels`を個別に測定する。
+
+```bash
+for input_mode in objects pixels; do
+  python benchmark_source_training.py \
+    --input-mode "${input_mode}" \
+    --device cuda \
+    --benchmark-seconds 120 \
+    --warmup-updates 2 \
+    --rollout-steps 1024 \
+    --ppo-epochs 4 \
+    --minibatch-size 256 \
+    --output "benchmark_results/${input_mode}_cuda.json"
+done
+```
 
 ```bash
 python benchmark_source_training.py \
@@ -195,7 +241,7 @@ python ocatari_source_ppo.py \
 ## 学習済みモデルのプレイ画像
 
 `render_trained_agent.py`は最終モデル、最良モデル、最新checkpointのいずれも
-読み込める。
+読み込める。`objects`のMLPと`pixels`のCNNをcheckpoint metadataから自動判定する。
 
 ```text
 model.pt

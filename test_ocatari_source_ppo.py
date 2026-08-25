@@ -7,7 +7,9 @@ import torch.optim as optim
 from PIL import Image
 
 from ocatari_source_ppo import (
+    ActorCriticCNN,
     ObservationStatistics,
+    PixelConfig,
     PPOConfig,
     RewardConfig,
     RolloutBuffer,
@@ -15,10 +17,12 @@ from ocatari_source_ppo import (
     format_duration,
     make_progress_row,
     ppo_update,
+    preprocess_pixel_frame,
     reward_components,
     transform_reward,
 )
 from benchmark_source_training import projection_rows
+from compare_representations import normalized_auc, validate_pair
 from render_trained_agent import (
     CapturedFrame,
     RepresentativeFrameReservoir,
@@ -52,6 +56,18 @@ class EncoderTests(unittest.TestCase):
         )
         self.assertEqual(observation.shape, (364,))
         self.assertTrue(np.isfinite(observation).all())
+
+    def test_pixel_preprocessing_has_expected_shape_and_range(self):
+        rgb = np.zeros((210, 160, 3), dtype=np.uint8)
+        rgb[:, :, 0] = 255
+        frame = preprocess_pixel_frame(
+            rgb,
+            PixelConfig(width=84, height=84, stack_size=4),
+        )
+        self.assertEqual(frame.shape, (84, 84))
+        self.assertEqual(frame.dtype, np.float32)
+        self.assertGreater(float(frame.mean()), 0.0)
+        self.assertLessEqual(float(frame.max()), 1.0)
 
     def test_temporal_slots_do_not_reorder_when_player_moves(self):
         temporal = CommonObjectEncoder(
@@ -230,6 +246,25 @@ class RewardAndBufferTests(unittest.TestCase):
         self.assertEqual(rows[1]["min"], 1.0)
         self.assertEqual(rows[1]["max"], 3.0)
 
+    def test_pixel_observation_statistics_are_compact(self):
+        statistics = ObservationStatistics(10)
+        observation = np.stack(
+            [
+                np.zeros((4, 4), dtype=np.float32),
+                np.ones((4, 4), dtype=np.float32),
+            ]
+        )
+        statistics.update(
+            observation,
+            stack_size=2,
+            summarize_pixels=True,
+        )
+        self.assertEqual(statistics.count, 1)
+        self.assertEqual(statistics.dimension, 10)
+        self.assertEqual(statistics.mean[0], 0.0)
+        self.assertEqual(statistics.mean[5], 1.0)
+        self.assertEqual(statistics.identical_stack_count, 0)
+
 
 class PPOTests(unittest.TestCase):
     def test_update_is_finite_and_changes_parameters(self):
@@ -267,6 +302,74 @@ class PPOTests(unittest.TestCase):
                 for old, new in zip(before, model.parameters())
             )
         )
+
+    def test_cnn_forward_and_multidimensional_rollout_buffer(self):
+        torch.manual_seed(0)
+        model = ActorCriticCNN((4, 84, 84), n_actions=6, hidden_size=32)
+        observations = torch.rand(2, 4, 84, 84)
+        logits, values = model(observations)
+        self.assertEqual(tuple(logits.shape), (2, 6))
+        self.assertEqual(tuple(values.shape), (2,))
+        self.assertTrue(torch.isfinite(logits).all())
+        buffer = RolloutBuffer(2, (4, 84, 84))
+        buffer.add(
+            observations[0].numpy(),
+            action=1,
+            reward=0.5,
+            done=False,
+            log_prob=-1.0,
+            value=0.0,
+        )
+        self.assertEqual(buffer.obs.shape, (2, 4, 84, 84))
+        np.testing.assert_allclose(buffer.obs[0], observations[0].numpy())
+
+
+class RepresentationComparisonTests(unittest.TestCase):
+    def test_normalized_auc(self):
+        self.assertAlmostEqual(
+            normalized_auc({0: 0.0, 50: 1.0, 100: 2.0}),
+            1.0,
+        )
+
+    def test_validate_pair_rejects_mismatched_conditions(self):
+        arguments = {key: None for key in (
+            "env",
+            "total_steps",
+            "frameskip",
+            "repeat_action_probability",
+            "stack_size",
+            "reward_mode",
+            "reward_scale",
+            "survival_reward_per_frame",
+            "life_loss_penalty",
+            "rollout_steps",
+            "gamma",
+            "gae_lambda",
+            "learning_rate",
+            "anneal_learning_rate",
+            "clip_epsilon",
+            "value_clip_epsilon",
+            "value_clipping",
+            "value_coefficient",
+            "entropy_coefficient",
+            "max_grad_norm",
+            "ppo_epochs",
+            "minibatch_size",
+            "hidden_size",
+            "target_kl",
+            "eval_interval",
+            "eval_episodes",
+            "random_eval_episodes",
+            "eval_seed",
+            "max_episode_steps",
+            "life_loss_terminal",
+            "auto_fire_reset",
+        )}
+        objects = {"arguments": dict(arguments), "curve": {0: 0.0, 1: 1.0}}
+        pixels = {"arguments": dict(arguments), "curve": {0: 0.0, 1: 1.0}}
+        pixels["arguments"]["frameskip"] = 8
+        with self.assertRaises(ValueError):
+            validate_pair(0, objects, pixels)
 
 
 class PlaybackImageTests(unittest.TestCase):

@@ -4,6 +4,7 @@ set -euo pipefail
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DEVICE="${DEVICE:-cuda}"
 TOTAL_STEPS="${TOTAL_STEPS:-1000000}"
+INPUT_MODE="${INPUT_MODE:-objects}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-source_baseline_runs}"
 SEEDS="${SEEDS:-0 1 2}"
 REWARD_MODE="${REWARD_MODE:-scaled_raw}"
@@ -16,6 +17,7 @@ mkdir -p "${OUTPUT_ROOT}"
 for seed in ${SEEDS}; do
   "${PYTHON_BIN}" ocatari_source_ppo.py \
     --env ALE/SpaceInvaders-v5 \
+    --input-mode "${INPUT_MODE}" \
     --object-mode ram \
     --total-steps "${TOTAL_STEPS}" \
     --seed "${seed}" \
