@@ -7,3 +7,5 @@ torch>=2.2
 numpy==1.26.4
 matplotlib>=3.8
 Pillow>=9
+imageio>=2.34
+imageio-ffmpeg>=0.5

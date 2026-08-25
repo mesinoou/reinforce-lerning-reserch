@@ -231,11 +231,16 @@ python render_trained_agent.py \
 
 出力:
 
+- `episode_001.mp4`: 全プレイフレームのMP4動画
 - `episode_001_contact_sheet.png`: episode全体の時系列コンタクトシート
 - `episode_001_final.png`: episode終了時の画面
 - `episode_001_frames/*.png`: episode全体から抽出した代表フレーム
 - `episode_001_trajectory.csv`: action、raw reward、Value、方策確率、life
 - `playback_summary.json`: モデルSHA-256、seed、方策、return、再生条件
+
+動画は既定で保存され、FPSは `60 / frameskip`（通常15 FPS）になる。
+明示的に変更する場合は `--video-fps 30`、動画を保存しない場合は
+`--no-save-video`を指定する。
 
 既定ではREM物体の枠とカテゴリ名を重ねる。ゲーム画面だけを保存する場合:
 

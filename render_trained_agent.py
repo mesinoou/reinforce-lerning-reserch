@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render representative play images from a trained OCAtari object PPO model.
+"""Render MP4 videos and representative play images from a trained model.
 
 Accepted model files:
 
@@ -9,7 +9,7 @@ Accepted model files:
 
 The renderer reconstructs the object encoder and ActorCriticMLP from checkpoint
 metadata, runs fixed-seed episodes, and saves representative frames, a contact
-sheet, a step-level trajectory, and provenance metadata.
+sheet, an MP4 video, a step-level trajectory, and provenance metadata.
 """
 
 from __future__ import annotations
@@ -351,6 +351,27 @@ def action_meaning(meanings: Sequence[str], action: int) -> str:
     return str(action)
 
 
+def open_video_writer(path: Path, fps: float) -> Any:
+    try:
+        import imageio.v2 as imageio
+    except ImportError as error:
+        raise RuntimeError(
+            "MP4 output requires imageio and imageio-ffmpeg. "
+            "Install requirements_ocatari_transfer.txt, or use "
+            "--no-save-video."
+        ) from error
+    return imageio.get_writer(
+        path,
+        format="FFMPEG",
+        mode="I",
+        fps=fps,
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=2,
+        ffmpeg_log_level="warning",
+    )
+
+
 @torch.no_grad()
 def render_episode(
     *,
@@ -380,6 +401,14 @@ def render_episode(
         args.max_representative_frames,
         episode_seed,
     )
+    episode_prefix = f"episode_{episode_number:03d}"
+    video_path = output_dir / f"{episode_prefix}.mp4"
+    video_fps = (
+        args.video_fps
+        if args.video_fps > 0.0
+        else 60.0 / loaded.frameskip
+    )
+    video_writer = None
     try:
         obs, info = env.reset(seed=episode_seed)
         obs, info = maybe_fire_after_reset(
@@ -394,18 +423,22 @@ def render_episode(
                 "Action-space mismatch: "
                 f"model={loaded.n_actions}, environment={env.action_space.n}"
             )
+        initial_frame = render_current_frame(
+            env,
+            overlay_objects=args.overlay_objects,
+            scale=args.scale,
+        )
         reservoir.add(
             CapturedFrame(
                 step=0,
                 cumulative_raw_return=0.0,
                 action_meaning="RESET",
-                image=render_current_frame(
-                    env,
-                    overlay_objects=args.overlay_objects,
-                    scale=args.scale,
-                ),
+                image=initial_frame,
             )
         )
+        if args.save_video:
+            video_writer = open_video_writer(video_path, video_fps)
+            video_writer.append_data(np.asarray(initial_frame))
 
         cumulative_raw_return = 0.0
         step = 0
@@ -448,17 +481,25 @@ def render_episode(
                     "done": done,
                 }
             )
-            if step % args.capture_every == 0 or done:
+            should_capture_representative = (
+                step % args.capture_every == 0 or done
+            )
+            current_frame = None
+            if args.save_video or should_capture_representative:
+                current_frame = render_current_frame(
+                    env,
+                    overlay_objects=args.overlay_objects,
+                    scale=args.scale,
+                )
+            if video_writer is not None:
+                video_writer.append_data(np.asarray(current_frame))
+            if should_capture_representative:
                 reservoir.add(
                     CapturedFrame(
                         step=step,
                         cumulative_raw_return=cumulative_raw_return,
                         action_meaning=last_action_meaning,
-                        image=render_current_frame(
-                            env,
-                            overlay_objects=args.overlay_objects,
-                            scale=args.scale,
-                        ),
+                        image=current_frame,
                     )
                 )
 
@@ -476,7 +517,6 @@ def render_episode(
                 )
             )
         captures = reservoir.selected()
-        episode_prefix = f"episode_{episode_number:03d}"
         frames_dir = ensure_dir(output_dir / f"{episode_prefix}_frames")
         frame_paths: List[str] = []
         if args.save_representative_frames:
@@ -518,17 +558,28 @@ def render_episode(
             ),
             "representative_frame_count": len(captures),
             "representative_frames": frame_paths,
+            "video": (
+                str(video_path.resolve())
+                if args.save_video
+                else None
+            ),
+            "video_fps": video_fps if args.save_video else None,
             "final_frame": str(final_frame_path.resolve()),
             "contact_sheet": str(contact_sheet_path.resolve()),
             "trajectory": str(trajectory_path.resolve()),
         }
     finally:
+        if video_writer is not None:
+            video_writer.close()
         env.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render play images from a trained OCAtari object PPO model."
+        description=(
+            "Render MP4 videos and play images from a trained "
+            "OCAtari object PPO model."
+        )
     )
     parser.add_argument("--model", required=True)
     parser.add_argument(
@@ -552,6 +603,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-representative-frames", type=int, default=20)
     parser.add_argument("--columns", type=int, default=4)
     parser.add_argument("--scale", type=int, default=2)
+    parser.add_argument(
+        "--save-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=0.0,
+        help=(
+            "MP4 frames per second. The default (0) uses 60 / frameskip."
+        ),
+    )
     parser.add_argument(
         "--overlay-objects",
         action=argparse.BooleanOptionalAction,
@@ -583,6 +647,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-representative-frames must be positive")
     if args.columns <= 0 or args.scale <= 0:
         parser.error("--columns and --scale must be positive")
+    if args.video_fps < 0.0:
+        parser.error("--video-fps must be non-negative")
     if args.repeat_action_probability > 1.0:
         parser.error("--repeat-action-probability must be <= 1")
     return args
@@ -655,6 +721,7 @@ def main() -> None:
             f"[episode {episode_index + 1}] "
             f"return={episode_summary['raw_return']:.2f} "
             f"steps={episode_summary['episode_length']:,} "
+            f"video={episode_summary['video']} "
             f"sheet={episode_summary['contact_sheet']}"
         )
 
@@ -686,6 +753,12 @@ def main() -> None:
         "episode_length_mean": float(lengths.mean()),
         "overlay_objects": args.overlay_objects,
         "capture_every_environment_steps": args.capture_every,
+        "save_video": args.save_video,
+        "video_fps": (
+            episode_summaries[0]["video_fps"]
+            if episode_summaries
+            else None
+        ),
         "episode_results": episode_summaries,
     }
     summary_path = output_dir / "playback_summary.json"
