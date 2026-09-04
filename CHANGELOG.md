@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-09-04
+
+### 学習済みソースからのAdvantage転移
+
+- ソース最終モデルの入力・報酬・PPO設定を継承してGalaxianを学習する入口を追加。
+- 固定Source Criticの1-step TDとTarget GAEを従来のraw mixで混合。
+- 現行の評価・進捗・ETA・checkpoint・MP4対応を共通学習器から再利用。
+- ソースSHA-256、Target初期重み、転移診断統計を記録。
+- source保存先への出力、新規runの上書き、再開時のteacher差し替えを拒否。
+- 対応target seed・alpha比較用スクリプトと比較グラフ生成を追加。
+
 ## 2026-08-25
 
 ### Representation comparison

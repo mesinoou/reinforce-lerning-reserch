@@ -6,6 +6,9 @@
 Modeの物体リスト入力を同条件比較し、その後GalaxianへのAdvantage転移を
 公平に評価することです。
 
+学習済みソースを固定してGalaxianへ転移する実験は
+[README_TARGET_TRANSFER.md](README_TARGET_TRANSFER.md)を参照してください。
+
 ## 現在の実験
 
 - ソース環境: `ALE/SpaceInvaders-v5`
@@ -28,6 +31,9 @@ Modeの物体リスト入力を同条件比較し、その後GalaxianへのAdvan
 - `aggregate_source_runs.py`: seed間集計
 - `test_ocatari_source_ppo.py`: 単体テスト
 - `ocatari_transfer_full_experiment.py`: 既存の一括転移実験
+- `ocatari_target_transfer.py`: 学習済みソースを指定したTarget PPO／Advantage転移
+- `run_target_transfer.sh`: 固定ソースでalpha・target seedを比較
+- `compare_transfer_runs.py`: 初期重み・条件一致を検証した転移比較グラフ
 
 学習中は各runの`progress.json`から進捗率、処理速度、残りsteps、ETA、
 推定終了時刻を確認できます。
