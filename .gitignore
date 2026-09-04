@@ -7,6 +7,8 @@
 source_results_*/
 source_baseline_runs/
 representation_comparison_runs/
+target_transfer_runs/
+target_transfer_results_*/
 benchmark_source_*.json
 benchmark_results/
 playback_*/

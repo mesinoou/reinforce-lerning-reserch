@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Train and compare object-list and pixel PPO agents on OCAtari.
 
-This program deliberately excludes transfer learning. Its only purpose is to
-establish whether PPO learns Space Invaders more effectively from the common
-object-centric representation than from pixels before source knowledge is used
-by a target task.
+Without --source-checkpoint this retains the source-only experiment. The target
+entry point reuses the same PPO, evaluation and logging with a frozen teacher.
 """
 
 from __future__ import annotations
@@ -39,8 +37,14 @@ import torch.nn as nn
 import torch.optim as optim
 from PIL import Image
 
+from advantage_transfer import (
+    advantage_metrics, mix_advantages, model_sha256, protect_output_directory,
+    read_source_checkpoint, teacher_td_advantage, validate_source_settings,
+)
+
 from ocatari_transfer_full_experiment import (
     ActorCriticMLP,
+    CommonObjectEncoder,
     EncoderConfig,
     ObjectEnv,
     ensure_dir,
@@ -90,6 +94,13 @@ UPDATE_FIELDS = [
     "life_loss_component_mean",
     "ale_frames_advanced_mean",
     "epochs_completed",
+    "transfer_alpha",
+    "source_advantage_mean",
+    "source_advantage_std",
+    "mixed_advantage_mean",
+    "mixed_advantage_std",
+    "source_target_sign_agreement",
+    "source_target_correlation",
 ]
 EVALUATION_FIELDS = [
     "stage",
@@ -1351,6 +1362,7 @@ def plot_results(
     update_rows: List[Dict[str, Any]],
     evaluation_rows: List[Dict[str, Any]],
     moving_average_window: int,
+    title: str = "Space Invaders source PPO",
 ) -> None:
     if episode_rows:
         steps = np.asarray(
@@ -1370,7 +1382,7 @@ def plot_results(
             linewidth=2,
             label=f"Moving average ({window} episodes)",
         )
-        ax.set_title("Space Invaders source PPO: training raw return")
+        ax.set_title(f"{title}: training raw return")
         ax.set_xlabel("Environment steps")
         ax.set_ylabel("Raw episode return")
         ax.grid(True, alpha=0.25)
@@ -1631,6 +1643,10 @@ def train(args: argparse.Namespace) -> Path:
             weights_only=False,
         )
         stored_arguments = resume_checkpoint.get("configuration", {})
+        if not args.source_checkpoint:
+            args.source_checkpoint = stored_arguments.get("source_checkpoint", "")
+        if args.source_checkpoint and not stored_arguments.get("source_checkpoint_sha256"):
+            raise ValueError("Use --source-checkpoint for the source; --resume must refer to a target transfer checkpoint")
         runtime_override_keys = {
             "total_steps",
             "device",
@@ -1646,16 +1662,17 @@ def train(args: argparse.Namespace) -> Path:
             "log_interval_episodes",
             "progress_interval_updates",
             "progress_interval_seconds",
+            "source_checkpoint",
         }
         for key, value in stored_arguments.items():
             if key not in runtime_override_keys and hasattr(args, key):
                 setattr(args, key, value)
 
-    output_dir = ensure_dir(
+    output_dir = (
         Path(
             args.output_dir
             or (
-                "source_results_"
+                ("target_transfer_results_" if args.source_checkpoint else "source_results_")
                 + datetime.now().strftime("%Y%m%d_%H%M%S")
                 + f"_seed{args.seed}"
             )
@@ -1701,6 +1718,57 @@ def train(args: argparse.Namespace) -> Path:
         death_penalty=args.death_penalty,
     )
 
+    source_model = None
+    transfer_metadata = None
+    if args.source_checkpoint:
+        source = read_source_checkpoint(Path(args.source_checkpoint))
+        validate_source_settings(
+            source, args, asdict(encoder_config), asdict(pixel_config),
+            asdict(reward_config),
+        )
+        if args.source_checkpoint_sha256 and args.source_checkpoint_sha256 != source["sha256"]:
+            raise ValueError("Source file hash changed since the target checkpoint; refusing to resume with a different teacher")
+        protect_output_directory(output_dir, Path(source["path"]), args.resume)
+        args.source_checkpoint = source["path"]
+        args.source_checkpoint_sha256 = source["sha256"]
+        payload = source["payload"]
+        source_shape = (
+            (CommonObjectEncoder(encoder_config).obs_dim,) if args.input_mode == "objects"
+            else pixel_config.observation_shape
+        )
+        # Teacher construction must not consume the target initialization RNG.
+        rng_state = capture_rng_state()
+        try:
+            source_model = make_actor_critic(
+                input_mode=args.input_mode,
+                observation_shape=source_shape,
+                n_actions=int(payload["n_actions"]),
+                hidden_size=int(source["ppo"]["hidden_size"]),
+            ).to(device)
+            source_model.load_state_dict(payload["model_state_dict"], strict=True)
+        finally:
+            restore_rng_state(rng_state)
+        source_model.eval()
+        source_model.requires_grad_(False)
+        transfer_metadata = {
+            "method": "raw_advantage_mix",
+            "source_checkpoint": source["path"],
+            "source_sha256": source["sha256"],
+            "source_env": payload.get("env_id"),
+            "source_steps": payload.get("steps", payload.get("environment_steps")),
+            "source_seed": payload.get("seed", source["runtime"].get("seed")),
+            "source_input_mode": args.input_mode,
+            "alpha": args.transfer_alpha,
+            "source_critic_frozen": True,
+            "source_model_state_sha256": model_sha256(source_model),
+            "target_initialization": "random; no source parameter copy",
+            "normalization": "normalize mixed Advantage once in PPO",
+        }
+        del source, payload
+    elif args.transfer_alpha != 0.0:
+        raise ValueError("Nonzero --transfer-alpha requires --source-checkpoint")
+    ensure_dir(output_dir)
+
     env = make_observation_env(
         input_mode=args.input_mode,
         env_id=args.env,
@@ -1729,6 +1797,7 @@ def train(args: argparse.Namespace) -> Path:
         n_actions=n_actions,
         hidden_size=ppo_config.hidden_size,
     ).to(device)
+    initial_target_sha256 = model_sha256(model)
     optimizer = optim.Adam(
         model.parameters(),
         lr=ppo_config.learning_rate,
@@ -1755,6 +1824,7 @@ def train(args: argparse.Namespace) -> Path:
         if resume_checkpoint is None:
             raise RuntimeError("Resume checkpoint was not loaded")
         checkpoint = resume_checkpoint
+        initial_target_sha256 = checkpoint.get("configuration", {}).get("initial_target_sha256", "")
         if checkpoint["env_id"] != args.env:
             raise ValueError(
                 f"Resume environment mismatch: {checkpoint['env_id']} != {args.env}"
@@ -1813,6 +1883,7 @@ def train(args: argparse.Namespace) -> Path:
         print(f"Resumed {resume_path} at environment step {global_steps}")
 
     starting_env_steps = global_steps
+    args.initial_target_sha256 = initial_target_sha256
 
     versions = {
         "python": sys.version,
@@ -1845,12 +1916,14 @@ def train(args: argparse.Namespace) -> Path:
             "model_parameter_count": model_parameter_count(model),
             "action_count": n_actions,
             "action_meanings": action_meanings,
+            "transfer": transfer_metadata,
+            "initial_target_sha256": initial_target_sha256,
         },
     )
     try:
         env.save_detection_snapshot(
             output_dir / "object_detection_snapshot.png",
-            f"Source PPO {args.input_mode}: {args.env}",
+            f"PPO {args.input_mode}: {args.env}",
         )
     except Exception as exc:
         print(f"Warning: object snapshot could not be saved: {exc}")
@@ -1864,6 +1937,10 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Model parameters: {model_parameter_count(model):,}")
     print(f"Actions: {n_actions} {action_meanings}")
     print(f"Training reward: {args.reward_mode}; raw return is logged separately")
+    if transfer_metadata is not None:
+        print(f"Frozen source: {args.source_checkpoint}")
+        print(f"Transfer: raw Advantage mix, alpha={args.transfer_alpha}; target initialized independently")
+        save_json(output_dir / "transfer_metadata.json", transfer_metadata)
 
     if not evaluation_rows:
         random_result = evaluate(
@@ -2180,6 +2257,22 @@ def train(args: argparse.Namespace) -> Path:
             ).to(device)
             advantages_tensor = torch.from_numpy(advantage_values).to(device)
             returns_tensor = torch.from_numpy(return_values).to(device)
+            source_advantages_tensor = None
+            if source_model is not None and args.transfer_alpha > 0.0:
+                source_advantages_tensor, _source_values = teacher_td_advantage(
+                    source_model, observations_tensor,
+                    torch.from_numpy(obs).to(device),
+                    torch.from_numpy(buffer.rewards[: buffer.ptr]).to(device),
+                    torch.from_numpy(buffer.dones[: buffer.ptr]).to(device),
+                    ppo_config.gamma, batch_size=ppo_config.minibatch_size,
+                )
+            mixed_advantages_tensor = mix_advantages(
+                advantages_tensor, source_advantages_tensor, args.transfer_alpha,
+            )
+            transfer_diagnostics = advantage_metrics(
+                advantages_tensor, source_advantages_tensor,
+                mixed_advantages_tensor, args.transfer_alpha,
+            )
             losses = ppo_update(
                 model,
                 optimizer,
@@ -2187,7 +2280,7 @@ def train(args: argparse.Namespace) -> Path:
                 actions_tensor,
                 old_log_probabilities_tensor,
                 old_values_tensor,
-                advantages_tensor,
+                mixed_advantages_tensor,
                 returns_tensor,
                 ppo_config,
             )
@@ -2199,6 +2292,7 @@ def train(args: argparse.Namespace) -> Path:
                     "ale_frames": global_steps * args.frameskip,
                     "learning_rate": current_learning_rate,
                     **losses,
+                    **transfer_diagnostics,
                     "explained_variance": explained_variance(
                         buffer.values[: buffer.ptr],
                         return_values,
@@ -2430,6 +2524,8 @@ def train(args: argparse.Namespace) -> Path:
                 "reward_config": asdict(reward_config),
                 "steps": global_steps,
                 "seed": args.seed,
+                "configuration": vars(args),
+                "transfer": transfer_metadata,
             },
             output_dir / "model.pt",
         )
@@ -2470,6 +2566,13 @@ def train(args: argparse.Namespace) -> Path:
             observation_shape=observation_shape,
             parameter_count=model_parameter_count(model),
         )
+        summary["transfer"] = transfer_metadata
+        summary["initial_target_sha256"] = initial_target_sha256
+        if source_model is not None:
+            final_source_hash = model_sha256(source_model)
+            if final_source_hash != transfer_metadata["source_model_state_sha256"]:
+                raise RuntimeError("Frozen source model unexpectedly changed")
+            summary["source_model_unchanged"] = True
         save_json(output_dir / "summary.json", summary)
         plot_results(
             output_dir,
@@ -2477,6 +2580,7 @@ def train(args: argparse.Namespace) -> Path:
             update_rows,
             evaluation_rows,
             args.moving_average_window,
+            title=f"{args.env} PPO ({args.input_mode}, alpha={args.transfer_alpha})",
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return output_dir
@@ -2498,11 +2602,11 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None, defaults=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train source-only PPO using either OCAtari objects or screen "
-            "pixels. Transfer learning is intentionally not run."
+            "Train PPO using OCAtari objects or pixels, optionally with a "
+            "frozen source critic for raw Advantage transfer."
         )
     )
     parser.add_argument("--env", default="ALE/SpaceInvaders-v5")
@@ -2526,6 +2630,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--resume", default="")
+    parser.add_argument("--source-checkpoint", default="", help="Trusted source model.pt; never used as target --resume")
+    parser.add_argument("--transfer-alpha", type=float, default=0.0, help="Fixed alpha for (1-alpha)*target_GAE + alpha*source_TD")
+    parser.set_defaults(source_checkpoint_sha256="", initial_target_sha256="")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
         "--deterministic-torch",
@@ -2666,7 +2773,11 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
         help="Also report after this many seconds; 0 disables.",
     )
-    args = parser.parse_args()
+    if defaults:
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.transfer_alpha) or not 0.0 <= args.transfer_alpha <= 1.0:
+        parser.error("--transfer-alpha must be finite and in [0, 1]")
 
     if not 0.0 <= args.repeat_action_probability <= 1.0:
         parser.error("--repeat-action-probability must be in [0, 1]")
