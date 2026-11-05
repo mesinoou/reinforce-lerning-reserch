@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.optim as optim
 from PIL import Image
 
+from object_channels import OBJECT_CHANNELS, OBJECT_CHANNEL_SCREEN, object_channel_spec
 from advantage_transfer import (
     advantage_metrics, mix_advantages, model_sha256, protect_output_directory,
     read_source_checkpoint, teacher_td_advantage, validate_source_settings,
@@ -174,6 +175,31 @@ class PixelConfig:
         return (self.stack_size, self.height, self.width)
 
 
+def object_channel_frame(objects: Iterable[Any], config: PixelConfig) -> np.ndarray:
+    maps = np.zeros((len(OBJECT_CHANNELS), config.height, config.width), dtype=np.float32)
+    channel_indices = {name.lower(): index for index, name in enumerate(OBJECT_CHANNELS)}
+    screen_width, screen_height = OBJECT_CHANNEL_SCREEN
+    for obj in objects:
+        if not CommonObjectEncoder._visible(obj) or getattr(obj, "hud", False):
+            continue
+        category = CommonObjectEncoder._category(obj)
+        if category not in channel_indices:
+            raise ValueError(f"Unexpected Space Invaders RAM category: {category}")
+        x, y, width, height = CommonObjectEncoder._xywh(obj)
+        if width <= 0 or height <= 0:
+            continue
+        left, top = max(0.0, x), max(0.0, y)
+        right, bottom = min(screen_width, x + width), min(screen_height, y + height)
+        if left >= right or top >= bottom:
+            continue
+        x0 = math.floor(left * config.width / screen_width)
+        x1 = math.ceil(right * config.width / screen_width)
+        y0 = math.floor(top * config.height / screen_height)
+        y1 = math.ceil(bottom * config.height / screen_height)
+        maps[channel_indices[category], y0:y1, x0:x1] = 1.0
+    return maps
+
+
 def preprocess_pixel_frame(
     rgb_frame: np.ndarray,
     pixel_config: PixelConfig,
@@ -237,8 +263,11 @@ class PixelEnv:
             self.pixel_config,
         )
 
+    def _stack_frames(self) -> np.ndarray:
+        return np.stack(self._frames, axis=0)
+
     def _stacked_observation(self) -> np.ndarray:
-        observation = np.stack(self._frames, axis=0).astype(
+        observation = self._stack_frames().astype(
             np.float32,
             copy=False,
         )
@@ -276,6 +305,48 @@ class PixelEnv:
 
     def save_detection_snapshot(self, path: Path, title: str) -> None:
         self.base_env.save_detection_snapshot(path, title)
+
+
+class ObjectChannelEnv(PixelEnv):
+    """Keep the pixel wrapper's transition and history, with RAM maps as input."""
+
+    def __init__(self, env_id, encoder_config, object_mode, frameskip,
+                 repeat_action_probability, pixel_config):
+        if env_id != "ALE/SpaceInvaders-v5" or object_mode != "ram":
+            raise ValueError("Object channels require ALE/SpaceInvaders-v5 in RAM mode")
+        from ocatari.ram.spaceinvaders import MAX_NB_OBJECTS
+
+        if set(MAX_NB_OBJECTS) != set(OBJECT_CHANNELS) or sum(MAX_NB_OBJECTS.values()) != 44:
+            raise ValueError(f"Unexpected Space Invaders RAM schema: {MAX_NB_OBJECTS}")
+        super().__init__(env_id, encoder_config, object_mode, frameskip,
+                         repeat_action_probability, pixel_config)
+        self.obs_shape = (len(OBJECT_CHANNELS) * pixel_config.stack_size,
+                          pixel_config.height, pixel_config.width)
+        self.obs_dim = int(np.prod(self.obs_shape))
+
+    def _preprocess_frame(self) -> np.ndarray:
+        return object_channel_frame(self.objects, self.pixel_config)
+
+    def _stack_frames(self) -> np.ndarray:
+        return np.concatenate(self._frames, axis=0)
+
+    def save_detection_snapshot(self, path: Path, title: str) -> None:
+        rgb = self.rgb_frame()
+        if tuple(rgb.shape[:2][::-1]) != OBJECT_CHANNEL_SCREEN:
+            raise ValueError(f"Unexpected Space Invaders screen size: {rgb.shape}")
+        fig, axes = plt.subplots(2, 3, figsize=(9, 6), layout="constrained")
+        axes.flat[0].imshow(rgb)
+        axes.flat[0].set_title("ALE screen")
+        for ax, name, layer in zip(axes.flat[1:], OBJECT_CHANNELS, self._frames[-1]):
+            ax.imshow(layer, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+            ax.set_title(name)
+        for ax in axes.flat:
+            ax.axis("off")
+        fig.suptitle(title)
+        try:
+            fig.savefig(path, dpi=140)
+        finally:
+            plt.close(fig)
 
 
 class ActorCriticCNN(nn.Module):
@@ -535,17 +606,19 @@ class ObservationStatistics:
         stack_size: int,
         *,
         summarize_pixels: bool = False,
+        channels_per_frame: int = 1,
     ) -> None:
         raw_value = np.asarray(observation, dtype=np.float64)
         frames = raw_value.reshape(stack_size, -1)
         if summarize_pixels:
+            layers = frames.reshape(stack_size * channels_per_frame, -1)
             value = np.stack(
                 [
-                    frames.mean(axis=1),
-                    frames.std(axis=1, ddof=0),
-                    frames.min(axis=1),
-                    frames.max(axis=1),
-                    np.count_nonzero(frames, axis=1) / frames.shape[1],
+                    layers.mean(axis=1),
+                    layers.std(axis=1, ddof=0),
+                    layers.min(axis=1),
+                    layers.max(axis=1),
+                    np.count_nonzero(layers, axis=1) / layers.shape[1],
                 ],
                 axis=1,
             ).reshape(-1)
@@ -981,6 +1054,13 @@ def observation_feature_names(
                 "pixel_nonzero_rate",
             )
         ]
+    if input_mode == "object_channels":
+        return [
+            f"frame[{frame}].{channel}.{statistic}"
+            for frame in range(pixel_config.stack_size)
+            for channel in OBJECT_CHANNELS
+            for statistic in ("mean", "std", "min", "max", "nonzero_rate")
+        ]
     raise ValueError(f"Unknown input mode: {input_mode}")
 
 
@@ -1002,8 +1082,9 @@ def make_observation_env(
             frameskip,
             repeat_action_probability,
         )
-    if input_mode == "pixels":
-        return PixelEnv(
+    if input_mode in {"pixels", "object_channels"}:
+        wrapper = ObjectChannelEnv if input_mode == "object_channels" else PixelEnv
+        return wrapper(
             env_id,
             encoder_config,
             object_mode,
@@ -1027,7 +1108,7 @@ def make_actor_critic(
             n_actions,
             hidden_size,
         )
-    if input_mode == "pixels":
+    if input_mode in {"pixels", "object_channels"}:
         return ActorCriticCNN(
             observation_shape,
             n_actions,
@@ -1258,9 +1339,12 @@ def save_checkpoint(
             "rng_state": capture_rng_state(),
             "configuration": vars(args),
             "input_mode": args.input_mode,
-            "model_type": "cnn" if args.input_mode == "pixels" else "mlp",
+            "model_type": "mlp" if args.input_mode == "objects" else "cnn",
             "encoder_config": asdict(encoder_config),
             "pixel_config": asdict(pixel_config),
+            **({"object_channel_spec": object_channel_spec(
+                    pixel_config.width, pixel_config.height, pixel_config.stack_size)}
+               if args.input_mode == "object_channels" else {}),
             "ppo_config": asdict(ppo_config),
             "reward_config": asdict(reward_config),
             "env_id": args.env,
@@ -1296,11 +1380,14 @@ def save_progress_files(
 ) -> None:
     save_csv(output_dir / "episodes.csv", episode_rows, EPISODE_FIELDS)
     save_csv(output_dir / "updates.csv", update_rows, UPDATE_FIELDS)
+    evaluation_path = output_dir / "periodic_evaluation.csv"
+    pending_evaluation_path = evaluation_path.with_suffix(".csv.tmp")
     save_csv(
-        output_dir / "periodic_evaluation.csv",
+        pending_evaluation_path,
         evaluation_rows,
         EVALUATION_FIELDS,
     )
+    pending_evaluation_path.replace(evaluation_path)
     action_fields = ["update", "env_steps"]
     if action_rows:
         action_fields.extend(
@@ -1643,6 +1730,9 @@ def train(args: argparse.Namespace) -> Path:
             weights_only=False,
         )
         stored_arguments = resume_checkpoint.get("configuration", {})
+        stored_mode = resume_checkpoint.get("input_mode", "objects")
+        if "object_channels" in {args.input_mode, stored_mode} and args.input_mode != stored_mode:
+            raise ValueError(f"Resume input-mode mismatch: {stored_mode} != {args.input_mode}")
         if not args.source_checkpoint:
             args.source_checkpoint = stored_arguments.get("source_checkpoint", "")
         if args.source_checkpoint and not stored_arguments.get("source_checkpoint_sha256"):
@@ -1692,6 +1782,14 @@ def train(args: argparse.Namespace) -> Path:
         height=args.pixel_height,
         stack_size=args.stack_size,
     )
+    channel_metadata = {}
+    if args.input_mode == "object_channels":
+        if args.source_checkpoint or args.transfer_alpha:
+            raise ValueError("Object-channel training is a source-only experiment")
+        channel_metadata = {"object_channel_spec": object_channel_spec(
+            pixel_config.width, pixel_config.height, pixel_config.stack_size)}
+        if resume_checkpoint and resume_checkpoint.get("object_channel_spec") != channel_metadata["object_channel_spec"]:
+            raise ValueError("Resume object-channel specification mismatch")
     ppo_config = PPOConfig(
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
@@ -1805,7 +1903,7 @@ def train(args: argparse.Namespace) -> Path:
     )
     buffer = RolloutBuffer(ppo_config.rollout_steps, observation_shape)
     observation_statistics = ObservationStatistics(
-        env.obs_dim if args.input_mode == "objects" else args.stack_size * 5
+        len(observation_feature_names(args.input_mode, encoder_config, pixel_config))
     )
     object_diagnostics = ObjectDiagnostics()
     episode_rows: List[Dict[str, Any]] = []
@@ -1905,9 +2003,10 @@ def train(args: argparse.Namespace) -> Path:
         {
             "arguments": vars(args),
             "input_mode": args.input_mode,
-            "model_type": "cnn" if args.input_mode == "pixels" else "mlp",
+            "model_type": "mlp" if args.input_mode == "objects" else "cnn",
             "encoder": asdict(encoder_config),
             "pixels": asdict(pixel_config),
+            **channel_metadata,
             "ppo": asdict(ppo_config),
             "reward": asdict(reward_config),
             "versions": versions,
@@ -2065,7 +2164,8 @@ def train(args: argparse.Namespace) -> Path:
                 observation_statistics.update(
                     obs,
                     args.stack_size,
-                    summarize_pixels=args.input_mode == "pixels",
+                    summarize_pixels=args.input_mode != "objects",
+                    channels_per_frame=(len(OBJECT_CHANNELS) if channel_metadata else 1),
                 )
                 object_diagnostics.update(env)
                 if len(object_samples) < args.object_sample_frames:
@@ -2510,9 +2610,7 @@ def train(args: argparse.Namespace) -> Path:
                 "model_state_dict": model.state_dict(),
                 "env_id": args.env,
                 "input_mode": args.input_mode,
-                "model_type": (
-                    "cnn" if args.input_mode == "pixels" else "mlp"
-                ),
+                "model_type": "mlp" if args.input_mode == "objects" else "cnn",
                 "obs_dim": env.obs_dim,
                 "observation_shape": list(observation_shape),
                 "model_parameter_count": model_parameter_count(model),
@@ -2520,6 +2618,7 @@ def train(args: argparse.Namespace) -> Path:
                 "action_meanings": action_meanings,
                 "encoder_config": asdict(encoder_config),
                 "pixel_config": asdict(pixel_config),
+                **channel_metadata,
                 "ppo_config": asdict(ppo_config),
                 "reward_config": asdict(reward_config),
                 "steps": global_steps,
@@ -2612,7 +2711,7 @@ def parse_args(argv=None, defaults=None) -> argparse.Namespace:
     parser.add_argument("--env", default="ALE/SpaceInvaders-v5")
     parser.add_argument(
         "--input-mode",
-        choices=["objects", "pixels"],
+        choices=["objects", "pixels", "object_channels"],
         default="objects",
         help="Policy input representation; all PPO conditions remain shared.",
     )
