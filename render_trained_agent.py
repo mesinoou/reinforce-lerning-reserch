@@ -29,10 +29,11 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from object_channels import OBJECT_CHANNELS, object_channel_spec
 from ocatari_source_ppo import (
     ActorCriticCNN,
     PixelConfig,
-    PixelEnv,
+    make_observation_env,
     maybe_fire_after_reset,
 )
 from ocatari_transfer_full_experiment import (
@@ -246,6 +247,15 @@ def load_trained_model(
                 pixel_config.observation_shape,
             )
         )
+    elif metadata["input_mode"] == "object_channels":
+        expected_spec = object_channel_spec(pixel_config.width, pixel_config.height,
+                                            pixel_config.stack_size)
+        if payload.get("object_channel_spec") != expected_spec:
+            raise ValueError("Incompatible object-channel model specification")
+        observation_shape = (len(OBJECT_CHANNELS) * pixel_config.stack_size,
+                             pixel_config.height, pixel_config.width)
+        if tuple(payload.get("observation_shape", ())) != observation_shape:
+            raise ValueError("Incompatible object-channel model shape")
     else:
         raise ValueError(f"Unknown input mode: {metadata['input_mode']}")
     observation_dimension = int(np.prod(observation_shape))
@@ -426,23 +436,15 @@ def render_episode(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(episode_seed)
 
-    if loaded.input_mode == "objects":
-        env = ObjectEnv(
-            loaded.env_id,
-            loaded.encoder_config,
-            loaded.object_mode,
-            loaded.frameskip,
-            loaded.repeat_action_probability,
-        )
-    else:
-        env = PixelEnv(
-            loaded.env_id,
-            loaded.encoder_config,
-            loaded.object_mode,
-            loaded.frameskip,
-            loaded.repeat_action_probability,
-            loaded.pixel_config,
-        )
+    env = make_observation_env(
+        input_mode=loaded.input_mode,
+        env_id=loaded.env_id,
+        encoder_config=loaded.encoder_config,
+        object_mode=loaded.object_mode,
+        frameskip=loaded.frameskip,
+        repeat_action_probability=loaded.repeat_action_probability,
+        pixel_config=loaded.pixel_config,
+    )
     trajectory_rows: List[Dict[str, Any]] = []
     reservoir = RepresentativeFrameReservoir(
         args.max_representative_frames,
